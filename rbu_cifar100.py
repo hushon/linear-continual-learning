@@ -123,7 +123,7 @@ class EWC:
         self.center = [torch.zeros_like(param) for param in self.model.parameters()]
 
     def _backward_hook(module: nn.Module, grad_input: torch.Tensor, grad_output: torch.Tensor):
-        raise NotImplementedError
+        pass
 
     def _accumulate_curvature_step(self):
         for m_param, ewc_param in zip(self.model.parameters(), self.importance):
