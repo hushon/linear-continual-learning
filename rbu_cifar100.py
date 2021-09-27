@@ -17,6 +17,7 @@ import copy
 from torch.utils.tensorboard.writer import SummaryWriter
 from utils import MultiEpochsDataLoader
 from dataset import TaskIncrementalTenfoldCIFAR100
+import shutil
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -44,11 +45,11 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_26'
+    LOG_DIR = '/workspace/runs/torch_rbu_cifar_28'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
-    # WEIGHT_DECAY = 1e-4
-    WEIGHT_DECAY = 0
+    WEIGHT_DECAY = 1e-4
+    # WEIGHT_DECAY = 0
     MAX_EPOCH = 40
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
@@ -56,7 +57,8 @@ class FLAGS(NamedTuple):
 
 
 if FLAGS.SAVE:
-    os.makedirs(FLAGS.LOG_DIR, exist_ok=True)
+    # os.makedirs(FLAGS.LOG_DIR, exist_ok=False)
+    shutil.copytree('./', FLAGS.LOG_DIR, dirs_exist_ok=False)
 
 
 def tprint(obj):
@@ -112,11 +114,20 @@ class MultiHeadWrapper(nn.Module):
         return [head(x) for head in self.heads]
 
 
+class CustomMSELoss(nn.MSELoss):
+    def __init__(self, size_average=None, reduce=None, reduction: str = 'mean') -> None:
+        super().__init__(size_average=size_average, reduce=reduce, reduction=reduction)
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return 0.5*F.mse_loss(input, target, reduction=self.reduction)
+
+
 class EWC:
-    def __init__(self, model: nn.Module, criterion: nn.Module):
+    def __init__(self, model: nn.Module, criterion: nn.Module, lamb: float = 1.0):
         self.model = model
         self.criterion = criterion
         self._reset_state()
+        self.lamb = lamb
 
     def _reset_state(self):
         self.importance = [torch.zeros_like(param) for param in self.model.parameters()]
@@ -142,7 +153,7 @@ class EWC:
             input = input.cuda()
             self.model.zero_grad()
             output = self.model(input)[t]
-            pseudo_target = 15.*torch.normal(output.detach()) #TODO
+            pseudo_target = torch.normal(output.detach()) #TODO
             loss = self.criterion(output, pseudo_target).sum(-1).squeeze() #TODO
             loss.backward()
             self._accumulate_curvature_step()
@@ -154,7 +165,7 @@ class EWC:
         loss = 0.
         for i, p, c in zip(self.importance, self.model.parameters(), self.center):
             loss += (i * torch.square(p - c)).sum()
-        return 0.5*loss
+        return self.lamb*0.5*loss
 
     def merge_regularizer(self, old_state_dict):
         old_importance = old_state_dict['importance']
@@ -217,7 +228,7 @@ def main():
         model.zero_grad()
     initialize_model(model)
 
-    criterion = nn.MSELoss(reduction='none')
+    criterion = CustomMSELoss(reduction='none')
 
     @torch.no_grad()
     def update_batchnorm():
@@ -281,7 +292,7 @@ def main():
     for t in trange(len(train_dataset_sequence)):
         train_loader = make_dataloader(train_dataset_sequence[t], True)
         train_loader_cycle = icycle(train_loader)
-        optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR, weight_decay=FLAGS.WEIGHT_DECAY)
+        optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
         lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_EPOCH*len(train_loader)))
 
         # regularizer = LWF(model, criterion)
@@ -296,13 +307,11 @@ def main():
             mse_loss = criterion(output[t], 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
             # lwf_loss = regularizer.compute_loss(input, output, t)
             # ewc_loss = regularizer.compute_loss()
-            # loss = mse_loss/(t+1) + ewc_loss*t/(t+1)
-            # loss = mse_loss
-            # loss = mse_loss/(t+1) + lwf_loss*t/(t+1)
             ewc_loss = sum(r.compute_loss() for r in regularizer_list)
-            loss = mse_loss/(t+1) + ewc_loss*t/(t+1)
+            reg_loss = ewc_loss
+            loss = mse_loss/(t+1) + reg_loss*t/(t+1)
             loss.backward()
-            # weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
+            weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
             optimizer.step()
             lr_scheduler.step()
 
@@ -324,7 +333,7 @@ def main():
         # regularizer.merge_regularizer(old_ewc_state)
 
         # compute ewc state
-        regularizer = EWC(model, criterion)
+        regularizer = EWC(model, criterion, 225.0)
         regularizer.compute_curvature(train_dataset_sequence[t], t, n_steps=10000)
         regularizer_list.append(regularizer)
 
