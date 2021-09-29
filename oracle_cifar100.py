@@ -48,7 +48,7 @@ class FLAGS(NamedTuple):
     INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-4
     # WEIGHT_DECAY = 0
-    MAX_EPOCH = 40
+    MAX_EPOCH = 200
     N_WORKERS = 4
     BN_UPDATE_STEPS = 0
     SAVE = True
@@ -189,7 +189,7 @@ def main():
 
     train_loader_sequence = [make_dataloader(dset, True) for dset in train_dataset_sequence]
     train_loader_sequence_cycle = [icycle(loader) for loader in train_loader_sequence]
-    optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR, weight_decay=FLAGS.WEIGHT_DECAY)
+    optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
     lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_EPOCH*len(train_loader_sequence[0])))
 
     model.eval()

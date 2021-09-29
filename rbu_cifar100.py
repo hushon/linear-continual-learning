@@ -45,19 +45,18 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_28'
+    LOG_DIR = '/workspace/runs/torch_rbu_cifar_39'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-4
     # WEIGHT_DECAY = 0
-    MAX_EPOCH = 40
+    MAX_EPOCH = 200
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
 
 
 if FLAGS.SAVE:
-    # os.makedirs(FLAGS.LOG_DIR, exist_ok=False)
     shutil.copytree('./', FLAGS.LOG_DIR, dirs_exist_ok=False)
 
 
@@ -123,11 +122,10 @@ class CustomMSELoss(nn.MSELoss):
 
 
 class EWC:
-    def __init__(self, model: nn.Module, criterion: nn.Module, lamb: float = 1.0):
+    def __init__(self, model: nn.Module, criterion: nn.Module):
         self.model = model
         self.criterion = criterion
         self._reset_state()
-        self.lamb = lamb
 
     def _reset_state(self):
         self.importance = [torch.zeros_like(param) for param in self.model.parameters()]
@@ -161,11 +159,11 @@ class EWC:
             ewc_param.div_(n_steps)
         self._update_center()
 
-    def compute_loss(self):
+    def compute_loss(self, lamb: float = 1.0):
         loss = 0.
         for i, p, c in zip(self.importance, self.model.parameters(), self.center):
             loss += (i * torch.square(p - c)).sum()
-        return self.lamb*0.5*loss
+        return lamb*0.5*loss
 
     def merge_regularizer(self, old_state_dict):
         old_importance = old_state_dict['importance']
@@ -307,9 +305,11 @@ def main():
             mse_loss = criterion(output[t], 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
             # lwf_loss = regularizer.compute_loss(input, output, t)
             # ewc_loss = regularizer.compute_loss()
-            ewc_loss = sum(r.compute_loss() for r in regularizer_list)
+            ewc_loss = sum(r.compute_loss(255.0) for r in regularizer_list)
             reg_loss = ewc_loss
+            # reg_loss = lwf_loss
             loss = mse_loss/(t+1) + reg_loss*t/(t+1)
+            # loss = mse_loss
             loss.backward()
             weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
             optimizer.step()
@@ -333,7 +333,7 @@ def main():
         # regularizer.merge_regularizer(old_ewc_state)
 
         # compute ewc state
-        regularizer = EWC(model, criterion, 225.0)
+        regularizer = EWC(model, criterion)
         regularizer.compute_curvature(train_dataset_sequence[t], t, n_steps=10000)
         regularizer_list.append(regularizer)
 
