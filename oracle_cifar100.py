@@ -17,6 +17,7 @@ import copy
 from torch.utils.tensorboard.writer import SummaryWriter
 from utils import MultiEpochsDataLoader
 from dataset import TaskIncrementalTenfoldCIFAR100
+import shutil
 
 # torch.backends.cuda.matmul.allow_tf32 = False
 # torch.backends.cudnn.allow_tf32 = False
@@ -43,19 +44,19 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_21'
+    LOG_DIR = '/workspace/runs/torch_rbu_cifar_47'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-4
     # WEIGHT_DECAY = 0
-    MAX_EPOCH = 200
+    MAX_EPOCH = 100
     N_WORKERS = 4
     BN_UPDATE_STEPS = 0
     SAVE = True
 
 
 if FLAGS.SAVE:
-    os.makedirs(FLAGS.LOG_DIR, exist_ok=True)
+    shutil.copytree('./', FLAGS.LOG_DIR, dirs_exist_ok=False)
 
 
 def tprint(obj):
@@ -70,7 +71,7 @@ def linear_schedule(max_iter):
 
 def weight_decay(named_parameters, lam):
     for name, param in named_parameters:
-        if 'bn' not in name:
+        if 'bn' not in name and param.grad is not None:
             param.grad.data.add_(param.data, alpha=lam)
 
 
@@ -106,6 +107,14 @@ class MultiHeadWrapper(nn.Module):
         return [head(x) for head in self.heads]
 
 
+class CustomMSELoss(nn.MSELoss):
+    def __init__(self, size_average=None, reduce=None, reduction: str = 'mean') -> None:
+        super().__init__(size_average=size_average, reduce=reduce, reduction=reduction)
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return 0.5*F.mse_loss(input, target, reduction=self.reduction)
+
+
 def main():
 
     transform_train = T.Compose([
@@ -130,7 +139,7 @@ def main():
     model = MultiHeadWrapper(model, 10, 512, 10)
     model.cuda()
 
-    criterion = nn.MSELoss(reduction='none')
+    criterion = CustomMSELoss(reduction='none')
 
     @torch.no_grad()
     def update_batchnorm():
@@ -150,7 +159,7 @@ def main():
             input = input.cuda()
             target = target.cuda()
             output = model(input)[t]
-            loss = 0.5*criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1)
+            loss = criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1)
             losses.append(loss.view(-1))
             corrects.append((target == output.max(-1).indices).view(-1))
         avg_loss = torch.cat(losses).mean().item()
@@ -190,28 +199,36 @@ def main():
     train_loader_sequence = [make_dataloader(dset, True) for dset in train_dataset_sequence]
     train_loader_sequence_cycle = [icycle(loader) for loader in train_loader_sequence]
     optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
-    lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_EPOCH*len(train_loader_sequence[0])))
+    lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(10*FLAGS.MAX_EPOCH*len(train_loader_sequence[0])))
 
     model.eval()
 
-    pbar = trange(FLAGS.MAX_EPOCH*len(train_loader_sequence[0]), bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')
-    for i in pbar:
+    for i in (pbar := trange(10*FLAGS.MAX_EPOCH*len(train_loader_sequence[0]))):
         optimizer.zero_grad()
-        for t in range(len(train_dataset_sequence)):
-            input, target = next(train_loader_sequence_cycle[t])
-            input = input.cuda()
-            target = target.cuda()
-            output = model(input)[t]
-            mse_loss = 0.5*criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
-            loss = mse_loss/10
-            loss.backward()
+        # for t in range(len(train_dataset_sequence)):
+        #     input, target = next(train_loader_sequence_cycle[t])
+        #     input = input.cuda()
+        #     target = target.cuda()
+        #     output = model(input)[t]
+        #     mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
+        #     loss = mse_loss/10
+        #     loss.backward()
+        t = i%10
+        input, target = next(train_loader_sequence_cycle[t])
+        input = input.cuda()
+        target = target.cuda()
+        output = model(input)[t]
+        mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
+        loss = mse_loss
+        loss.backward()
+
         weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
         optimizer.step()
         lr_scheduler.step()
 
         if (global_step+1)%50 == 0:
             tprint(f'[TRAIN][{i}/{len(pbar)-1}] LR {lr_scheduler.get_last_lr()[-1]:.2e} | loss {loss.cpu().item():.3f}')
-            # summary_writer.add_scalar('lr', lr_scheduler.get_last_lr()[-1], global_step=global_step)
+            summary_writer.add_scalar('lr', lr_scheduler.get_last_lr()[-1], global_step=global_step)
 
         if (global_step+1)%150 == 0:
             evaluate_sequence(t)

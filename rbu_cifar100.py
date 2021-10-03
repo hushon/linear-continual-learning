@@ -18,6 +18,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from utils import MultiEpochsDataLoader
 from dataset import TaskIncrementalTenfoldCIFAR100
 import shutil
+from kfac import KFACRegularizer
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -45,12 +46,12 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_39'
+    LOG_DIR = '/workspace/runs/torch_rbu_cifar_48'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-4
     # WEIGHT_DECAY = 0
-    MAX_EPOCH = 200
+    MAX_EPOCH = 100
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
@@ -130,9 +131,6 @@ class EWC:
     def _reset_state(self):
         self.importance = [torch.zeros_like(param) for param in self.model.parameters()]
         self.center = [torch.zeros_like(param) for param in self.model.parameters()]
-
-    def _backward_hook(module: nn.Module, grad_input: torch.Tensor, grad_output: torch.Tensor):
-        pass
 
     def _accumulate_curvature_step(self):
         for m_param, ewc_param in zip(self.model.parameters(), self.importance):
@@ -284,7 +282,7 @@ def main():
 
     update_batchnorm()
 
-    # regularizer = EWC(model, criterion)
+    # regularizer = EWC(model.module, criterion)
     regularizer_list = []
 
     for t in trange(len(train_dataset_sequence)):
@@ -305,8 +303,9 @@ def main():
             mse_loss = criterion(output[t], 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
             # lwf_loss = regularizer.compute_loss(input, output, t)
             # ewc_loss = regularizer.compute_loss()
-            ewc_loss = sum(r.compute_loss(255.0) for r in regularizer_list)
-            reg_loss = ewc_loss
+            # weight_penalty_loss = sum(r.compute_loss(255.0) for r in regularizer_list)
+            weight_penalty_loss = sum(r.compute_loss() for r in regularizer_list)
+            reg_loss = weight_penalty_loss*100
             # reg_loss = lwf_loss
             loss = mse_loss/(t+1) + reg_loss*t/(t+1)
             # loss = mse_loss
@@ -316,7 +315,7 @@ def main():
             lr_scheduler.step()
 
             if (global_step+1)%50 == 0:
-                tprint(f'[TRAIN][{i}/{max_step}] LR {lr_scheduler.get_last_lr()[-1]:.2e} | loss {loss.cpu().item():.3f}')
+                tprint(f'[TRAIN][{i}/{max_step}] LR {lr_scheduler.get_last_lr()[-1]:.2e} | {mse_loss.cpu().item():.3f} | {reg_loss:.3f}')
                 summary_writer.add_scalar('lr', lr_scheduler.get_last_lr()[-1], global_step=global_step)
 
             if (global_step+1)%150 == 0:
@@ -333,8 +332,13 @@ def main():
         # regularizer.merge_regularizer(old_ewc_state)
 
         # compute ewc state
-        regularizer = EWC(model, criterion)
-        regularizer.compute_curvature(train_dataset_sequence[t], t, n_steps=10000)
+        # regularizer = EWC(model, criterion)
+        # regularizer.compute_curvature(train_dataset_sequence[t], t, n_steps=10000)
+        # regularizer_list.append(regularizer)
+
+        # compute kfac state
+        regularizer = KFACRegularizer(model.module, criterion)
+        regularizer.compute_curvature(train_dataset_sequence[t], t, n_steps=1000)
         regularizer_list.append(regularizer)
 
 
