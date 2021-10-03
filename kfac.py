@@ -8,14 +8,17 @@ from typing import Tuple, List, NamedTuple, Mapping, Optional, Union, Literal
 from tqdm import tqdm, trange
 from utils import icycle, MultiEpochsDataLoader
 from dataclasses import dataclass
+from collections import OrderedDict
 
 
 @dataclass
 class KFACState:
     S: torch.Tensor
     A: torch.Tensor
-    center: torch.Tensor
-    # layer_type: Union[Literal['linear'], Literal['conv'], Literal['bn']]
+    # center: torch.Tensor
+    weight: torch.Tensor
+    bias: torch.Tensor
+    layer_type: Union[Literal['linear'], Literal['conv'], Literal['bn']]
 
 
 @dataclass
@@ -76,6 +79,39 @@ def compute_S(module: nn.Module, g: torch.Tensor) -> torch.Tensor:
     return S
 
 
+def unfold_weight(weight: torch.Tensor, bias: torch.Tensor = None):
+    is_bn = weight.ndim == 1
+    weight_shape = weight.shape
+    has_bias = bias is not None
+
+    if weight.ndim == 1: # (C, )
+        weight = weight.diag() # (C, C)
+    elif weight.ndim == 2: # (Nout, Nin)
+        pass
+    elif weight.ndim == 4: # (Cout, Cin, k, k)
+        weight = weight.reshape(weight.size(0), -1) # (Cout, Cin*k*k)
+    else:
+        raise ValueError(f'{weight.ndim}')
+
+    if has_bias:
+        weight_aug = torch.cat((weight, bias[:, None]), dim=1)
+    else:
+        weight_aug = weight
+
+    def revert_fn(weight: torch.Tensor):
+        if has_bias:
+            weight, bias = weight[:, :-1], weight[:, -1]
+        else:
+            weight, bias = weight, None
+        if is_bn:
+            weight = weight.diagonal()
+        else:
+            weight = weight.reshape(weight_shape)
+        return weight, bias
+
+    return weight_aug, revert_fn
+
+
 class KFACRegularizer:
     layer_types = (CustomLinear, CustomConv2d, CustomBatchNorm2d)
 
@@ -83,18 +119,26 @@ class KFACRegularizer:
         self.model = model
         self.criterion = criterion
         self.modules : List[nn.Module] = [m for m in self.model.modules() if type(m) in self.layer_types]
-        self.a_dict : Mapping[nn.Module, torch.Tensor] = dict()
-        self.g_dict : Mapping[nn.Module, torch.Tensor] = dict()
-        self.kfac_state_dict : Mapping[nn.Module, KFACState] = dict()
+        self.a_dict : Mapping[nn.Module, torch.Tensor] = OrderedDict()
+        self.g_dict : Mapping[nn.Module, torch.Tensor] = OrderedDict()
+        self.kfac_state_dict : Mapping[nn.Module, KFACState] = OrderedDict()
         self.hook_handles : List[RemovableHandle] = []
         self._init_kfac_states()
 
     def _init_kfac_states(self) -> None:
+        layer_type_dict = {
+            CustomLinear: 'linear',
+            CustomConv2d: 'conv',
+            CustomBatchNorm2d: 'bn'
+        }
         for module in self.modules:
             kfac_state = KFACState(
                 S = module.weight.new_tensor(0.),
                 A = module.weight.new_tensor(0.),
-                center = module.weight.new_tensor(0.),
+                weight = None,
+                bias = None,
+                layer_type = layer_type_dict[type(module)]
+                # center = module.weight.new_tensor(0.),
             )
             self.kfac_state_dict[module] = kfac_state
 
@@ -119,7 +163,6 @@ class KFACRegularizer:
     @torch.no_grad()
     def _forward_hook(self, module: nn.Module, input: Tuple[torch.Tensor, ...], output: Tuple[torch.Tensor, ...]) -> None:
         _, jvp = output # primal output
-
         def _tensor_backward_hook(grad: torch.Tensor) -> None:
             self.g_dict[module] = grad.data.clone()
         jvp.register_hook(_tensor_backward_hook)
@@ -143,25 +186,8 @@ class KFACRegularizer:
     @torch.no_grad()
     def _update_center(self):
         for module in self.modules:
-            weight = module.weight_tangent
-            bias = module.bias_tangent
-            kfac_state = self.kfac_state_dict[module]
-            if isinstance(module, CustomLinear):
-                if bias is not None:
-                    center = torch.cat([weight, bias[:, None]], dim=1)
-                else:
-                    center = weight # (Nout, Nin)
-            elif isinstance(module, CustomConv2d):
-                center = weight.reshape(weight.size(0), -1) # (Cout, Cin*k*k)
-                if bias is not None:
-                    center = torch.cat([center, bias[:, None]], dim=1)
-            elif isinstance(module, CustomBatchNorm2d): #TODO
-                center = weight.diag() # (C,C)
-                if bias is not None:
-                    center = torch.cat([center, bias[:, None]], dim=1)
-            else:
-                raise NotImplementedError(f'{type(module)}')
-            kfac_state.center.data = center.clone()
+            self.kfac_state_dict[module].weight = module.weight_tangent.clone()
+            self.kfac_state_dict[module].bias = module.bias_tangent.clone() if module.bias_tangent is not None else None
 
     def compute_curvature(self, dataset: Dataset, t: int, n_steps: int) -> None:
         self._register_hooks()
@@ -198,49 +224,27 @@ class KFACRegularizer:
 class KFAC_penalty(torch.autograd.Function):
     @staticmethod
     def forward(ctx, kfac_state: KFACState, weight: torch.Tensor, bias: Optional[torch.Tensor] = None):
-        if weight.ndim == 2:
-            new_center = weight # (Nout, Nin)
-        elif weight.ndim == 4:
-            new_center = weight.reshape(weight.size(0), -1) # (Cout, Cin*k*k)
-        elif weight.ndim == 1:
-            new_center = weight.diag() # (C, C) TODO: inefficient implementation
-        else:
-            raise ValueError(f'Cannot infer layer type: {weight.shape}')
 
-        if bias is not None:
-            new_center = torch.cat([new_center, bias[:, None]], dim=1)
+        param, revert_fn = unfold_weight(weight, bias)
+        center, revert_fn = unfold_weight(kfac_state.weight, kfac_state.bias)
+
+        ctx.revert_fn = revert_fn
 
         S = kfac_state.S # (Nout, Nout)
         A = kfac_state.A # (Nin, Nin)
-        center = kfac_state.center # (Nout, Nin)
 
-        dw = new_center - center
+        dw = param - center
         Hdw = torch.chain_matmul(S, dw, A) # (Nout, Nin) TODO: how to compute for diagonal layer?
         loss = dw.view(-1).dot(Hdw.view(-1))*0.5
 
-        if bias is not None:
-            Hdw_weight = Hdw[:, :-1]
-            if weight.ndim == 1:
-                Hdw_weight = torch.diagonal(Hdw_weight)
-            Hdw_bias = Hdw[:, -1]
-        else:
-            Hdw_weight = Hdw.reshape(weight.shape)
-            if weight.ndim == 1:
-                Hdw_weight = torch.diagonal(Hdw_weight)
-            Hdw_bias = None
-
-        ctx.save_for_backward(Hdw_weight, Hdw_bias)
+        ctx.save_for_backward(Hdw)
 
         return loss
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         # grad_output.shape == (,)
-        Hdw_weight, Hdw_bias = ctx.saved_tensors
-        if Hdw_bias is not None:
-            grad_weight = grad_output*Hdw_weight
-            grad_bias = grad_output*Hdw_bias
-        else:
-            grad_weight = grad_output*Hdw_weight
-            grad_bias = None
+        Hdw, = ctx.saved_tensors
+        grad_param = grad_output*Hdw
+        grad_weight, grad_bias = ctx.revert_fn(grad_param)
         return None, grad_weight, grad_bias

@@ -49,9 +49,9 @@ class FLAGS(NamedTuple):
     LOG_DIR = '/workspace/runs/torch_rbu_cifar_48'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
-    WEIGHT_DECAY = 1e-4
-    # WEIGHT_DECAY = 0
-    MAX_EPOCH = 100
+    # WEIGHT_DECAY = 1e-4
+    WEIGHT_DECAY = 0
+    MAX_EPOCH = 50
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
@@ -305,7 +305,7 @@ def main():
             # ewc_loss = regularizer.compute_loss()
             # weight_penalty_loss = sum(r.compute_loss(255.0) for r in regularizer_list)
             weight_penalty_loss = sum(r.compute_loss() for r in regularizer_list)
-            reg_loss = weight_penalty_loss*100
+            reg_loss = weight_penalty_loss
             # reg_loss = lwf_loss
             loss = mse_loss/(t+1) + reg_loss*t/(t+1)
             # loss = mse_loss
@@ -338,6 +338,7 @@ def main():
 
         # compute kfac state
         regularizer = KFACRegularizer(model.module, criterion)
+        # regularizer = KFACRegularizer(model, criterion)
         regularizer.compute_curvature(train_dataset_sequence[t], t, n_steps=1000)
         regularizer_list.append(regularizer)
 
