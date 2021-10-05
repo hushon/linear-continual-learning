@@ -19,6 +19,7 @@ from utils import MultiEpochsDataLoader
 from dataset import TaskIncrementalTenfoldCIFAR100
 import shutil
 from kfac import KFACRegularizer
+from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -46,12 +47,12 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_48'
+    LOG_DIR = '/workspace/runs/torch_rbu_cifar_59'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
-    # WEIGHT_DECAY = 1e-4
-    WEIGHT_DECAY = 0
-    MAX_EPOCH = 50
+    WEIGHT_DECAY = 1e-5
+    # WEIGHT_DECAY = 0
+    MAX_EPOCH = 200
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
@@ -75,6 +76,14 @@ def weight_decay(named_parameters, lam):
     for name, param in named_parameters:
         if 'bn' not in name:
             param.grad.data.add_(param.data, alpha=lam)
+
+
+def weight_decay_origin(model: nn.Module, lam: float = 1e-4):
+    for module in model.modules():
+        if isinstance(module, (CustomLinear, CustomConv2d)):
+            module.weight_tangent.grad.data.add_(module.weight.data + module.weight_tangent.data, alpha=lam)
+            if module.bias_tangent is not None:
+                module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
 
 
 def make_dataloader(
@@ -307,10 +316,11 @@ def main():
             weight_penalty_loss = sum(r.compute_loss() for r in regularizer_list)
             reg_loss = weight_penalty_loss
             # reg_loss = lwf_loss
-            loss = mse_loss/(t+1) + reg_loss*t/(t+1)
+            loss = (mse_loss + reg_loss)/(t+1)
             # loss = mse_loss
             loss.backward()
-            weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
+            weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
+            # weight_decay_origin(model.module, FLAGS.WEIGHT_DECAY)
             optimizer.step()
             lr_scheduler.step()
 
@@ -318,7 +328,7 @@ def main():
                 tprint(f'[TRAIN][{i}/{max_step}] LR {lr_scheduler.get_last_lr()[-1]:.2e} | {mse_loss.cpu().item():.3f} | {reg_loss:.3f}')
                 summary_writer.add_scalar('lr', lr_scheduler.get_last_lr()[-1], global_step=global_step)
 
-            if (global_step+1)%150 == 0:
+            if (global_step+1)%250 == 0:
                 evaluate_sequence(t)
 
             global_step += 1
@@ -337,8 +347,7 @@ def main():
         # regularizer_list.append(regularizer)
 
         # compute kfac state
-        regularizer = KFACRegularizer(model.module, criterion)
-        # regularizer = KFACRegularizer(model, criterion)
+        regularizer = KFACRegularizer(model, criterion)
         regularizer.compute_curvature(train_dataset_sequence[t], t, n_steps=1000)
         regularizer_list.append(regularizer)
 
