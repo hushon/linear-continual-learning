@@ -47,7 +47,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_59'
+    LOG_DIR = '/workspace/runs/torch_rbu_cifar_61'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-5
@@ -319,8 +319,8 @@ def main():
             loss = (mse_loss + reg_loss)/(t+1)
             # loss = mse_loss
             loss.backward()
-            weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
-            # weight_decay_origin(model.module, FLAGS.WEIGHT_DECAY)
+            # weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
+            weight_decay_origin(model.module, FLAGS.WEIGHT_DECAY)
             optimizer.step()
             lr_scheduler.step()
 
