@@ -13,17 +13,16 @@ from torch import optim
 
 @dataclass
 class KFACState:
-    S: torch.Tensor
-    A: torch.Tensor
-    weight: torch.Tensor
-    bias: torch.Tensor
+    S: torch.Tensor = None
+    A: torch.Tensor = None
+    weight: torch.Tensor = None
+    bias: torch.Tensor = None
 
 
 @dataclass
 class EWCState:
-    g: torch.Tensor
-    weight: torch.Tensor
-    bias: torch.Tensor
+    G: torch.Tensor = None
+    parameter: torch.Tensor = None
 
 
 @torch.no_grad()
@@ -136,12 +135,7 @@ class KFACRegularizer:
 
     def _init_kfac_states(self) -> None:
         for module in self.modules:
-            self.kfac_state_dict[module] = KFACState(
-                                S = None,
-                                A = None,
-                                weight = None,
-                                bias = None,
-                            )
+            self.kfac_state_dict[module] = KFACState()
 
     def _del_temp_states(self) -> None:
         del self.a_dict
@@ -149,21 +143,12 @@ class KFACRegularizer:
 
     def _register_hooks(self) -> None:
         for module in self.modules:
-            # handle = module.register_forward_pre_hook(self._forward_pre_hook)
-            # self.hook_handles.append(handle)
             handle = module.register_forward_hook(self._forward_hook)
             self.hook_handles.append(handle)
-            # handle = module.register_full_backward_hook(self._backward_hook)
-            # self.hook_handles.append(handle)
 
     def _remove_hooks(self) -> None:
         for handle in self.hook_handles:
             handle.remove()
-
-    # @torch.no_grad()
-    # def _forward_pre_hook(self, module: nn.Module, input: Tuple[torch.Tensor, ...]) -> None:
-    #     a, _ = input # primal input
-    #     self.a_dict[module] = a.detach().clone()
 
     @torch.no_grad()
     def _forward_hook(self, module: nn.Module, input: Tuple[torch.Tensor, ...], output: Tuple[torch.Tensor, ...]) -> None:
@@ -174,11 +159,6 @@ class KFACRegularizer:
         def _tensor_backward_hook(grad: torch.Tensor) -> None:
             self.g_dict[module] = grad.detach()
         jvp.register_hook(_tensor_backward_hook)
-
-    # @torch.no_grad()
-    # def _backward_hook(self, module: nn.Module, grad_input: Tuple[torch.Tensor, ...], grad_output: Tuple[torch.Tensor, ...]) -> None:
-    #     _, g_jvp = grad_output # grad of jvp output
-    #     self.g_dict[module] = g_jvp.detach()
 
     @torch.no_grad()
     def _accumulate_curvature_step(self) -> None:
@@ -227,7 +207,6 @@ class KFACRegularizer:
             self.model.zero_grad()
             output = self.model(input)[t]
             pseudo_target = torch.normal(output.detach())
-            # loss = self.criterion(output, pseudo_target).sum(-1).mean()
             loss = self.criterion(output, pseudo_target).sum(-1).sum()
             loss.backward()
             self._accumulate_curvature_step()
@@ -241,32 +220,90 @@ class KFACRegularizer:
         loss = sum(KFAC_penalty.apply(self.kfac_state_dict[m], m.weight_tangent, m.bias_tangent) for m in self.modules)
         return loss
 
+    # def train_dataset(self, dataset: Dataset, t: int, n_steps: int) -> None:
+    #     data_loader = MultiEpochsDataLoader(
+    #                         dataset,
+    #                         batch_size=64,
+    #                         shuffle=True,
+    #                         drop_last=True,
+    #                         num_workers=4,
+    #                     )
+    #     optimizer = optim.Adam(self.model.parameters(), lr=1e-5)
+    #     data_loader_cycle = icycle(data_loader)
+    #     self.init_state_dict = self.model.state_dict().copy()
+    #     self.model.eval()
+    #     for _ in trange(n_steps):
+    #         input, target = next(data_loader_cycle)
+    #         input = input.cuda()
+    #         self.model.zero_grad()
+    #         output = self.model(input)[t]
+    #         pseudo_target = torch.normal(output.detach())
+    #         loss = self.criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
+    #         loss.backward()
 
-    def train_dataset(self, dataset: Dataset, t: int, n_steps: int) -> None:
-        data_loader = MultiEpochsDataLoader(
-                            dataset,
-                            batch_size=64,
-                            shuffle=True,
-                            drop_last=True,
-                            num_workers=4,
-                        )
-        optimizer = optim.Adam(self.model.parameters(), lr=1e-5)
-        data_loader_cycle = icycle(data_loader)
-        state_dict = self.model.state_dict().copy()
-        self.model.eval()
-        for _ in trange(n_steps):
-            input, target = next(data_loader_cycle)
-            input = input.cuda()
-            self.model.zero_grad()
-            output = self.model(input)[t]
-            pseudo_target = torch.normal(output.detach())
-            loss = self.criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
-            loss.backward()
+
+def kfac_mvp(kfac_state: KFACState, vec: torch.Tensor) -> torch.Tensor:
+    """Computes the matrix-vector product, where the matrix is factorized by a Kronecker product.
+    Uses 'vec trick' to compute the product efficiently.
+
+    Args:
+        kfac_state (KFACState): A Kronecker-factored matrix
+        vector (torch.Tensor): A vector
+
+    Returns:
+        torch.Tensor: Matrix-vector product
+    """
+
+    S = kfac_state.S
+    A = kfac_state.A
+    m, n = S.shape
+    p, q = A.shape
+    V = vec.view(n, p)
+    mvp = torch.chain_matmul(S, V, A) # (m, q)
+    return mvp.view(-1)
+
+
+def kfac_loss_batchnorm(kfac_state: KFACState, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    assert weight.ndim == 1 # is_batchnorm
+    S = kfac_state.S # (C, C)
+    A = kfac_state.A # (C, C) or (C+1, C+1)
+
+    if bias is not None:
+        dw = kfac_state.weight - weight # (C,)
+        db = kfac_state.bias - bias # (C,)
+        Sdw = S * dw[None, :]
+        Sdb = torch.mv(S, db)
+        Sv = torch.cat((Sdw, Sdb[:, None]), dim=1) # (C, C+1)
+        Hv = Sv @ A # (C, C+1)
+        Hdw = Hv[:, :-1].diagonal() # (C,)
+        Hdb = Hv[:, -1] # (C,)
+        vHv = torch.dot(dw, Hdw) + torch.dot(db, Hdb)
+        return 0.5 * vHv, Hdw, Hdb
+    else:
+        dw = kfac_state.weight - weight # (C,)
+        Sdw = S * dw[None, :]
+        Sv = Sdw
+        Hv = Sv @ A # (C, C)
+        Hdw = Hv.diagonal() # (C,)
+        vHv = torch.dot(dw, Hdw)
+        return 0.5 * vHv, Hdw, None
+
+
+def kfac_loss_linear_conv(kfac_state: KFACState, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+    S = kfac_state.S # (Nout, Nout)
+    A = kfac_state.A # (Nin, Nin)
+    param, fold_weight_fn = unfold_weight(weight, bias)
+    center, fold_weight_fn = unfold_weight(kfac_state.weight, kfac_state.bias)
+    v = param - center
+    Hv = torch.chain_matmul(S, v, A) # (Nout, Nin)
+    vHv = torch.dot(v.view(-1), Hv.view(-1))
+    Hdw, Hdb = fold_weight_fn(Hv)
+    return 0.5 * vHv, Hdw, Hdb
 
 
 class KFAC_penalty(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, kfac_state: KFACState, weight: torch.Tensor, bias: Optional[torch.Tensor] = None):
+    def forward(ctx, kfac_state: KFACState, weight: torch.Tensor, bias: Optional[torch.Tensor] = None) -> torch.Tensor:
 
         param, fold_weight_fn = unfold_weight(weight, bias)
         center, fold_weight_fn = unfold_weight(kfac_state.weight, kfac_state.bias)
@@ -288,3 +325,66 @@ class KFAC_penalty(torch.autograd.Function):
         grad_param = grad_output*Hdw
         grad_weight, grad_bias = ctx.fold_weight_fn(grad_param)
         return None, grad_weight, grad_bias
+
+
+class EWCRegularizer:
+    def __init__(self, model: nn.Module, criterion: nn.Module):
+        self.model = model
+        self.criterion = criterion
+        self.ewc_state_dict : Mapping[nn.Parameter, EWCState] = OrderedDict()
+        self.n_steps = 0
+        self._reset_state()
+
+    def _reset_state(self):
+        for parameter in self.model.parameters():
+            self.ewc_state_dict[parameter] = EWCState(
+                G = torch.zeros_like(parameter),
+                parameter = None
+            )
+
+    def _accumulate_curvature_step(self):
+        for parameter in self.model.parameters():
+            self.ewc_state_dict[parameter].G.add_(parameter.grad.data.square())
+        self.n_steps += 1
+
+    def _update_center(self):
+        for parameter in self.model.parameters():
+            self.ewc_state_dict[parameter].parameter = parameter.detach().clone()
+
+    def _divide_curvature(self):
+        for ewc_state in self.ewc_state_dict.values():
+            ewc_state.G.div_(self.n_steps)
+
+    def compute_curvature(self, dataset: torch.utils.data.Dataset, t, n_steps):
+        self._reset_state()
+        data_loader = MultiEpochsDataLoader(
+                            dataset,
+                            batch_size=1,
+                            shuffle=True,
+                            drop_last=True,
+                            num_workers=4,
+                        )
+        data_loader_cycle = icycle(data_loader)
+        self.model.eval()
+        for _ in trange(n_steps):
+            input, _ = next(data_loader_cycle)
+            input = input.cuda()
+            self.model.zero_grad()
+            output = self.model(input)[t]
+            pseudo_target = torch.normal(output.detach()) #TODO
+            loss = self.criterion(output, pseudo_target).sum(-1).squeeze() #TODO
+            loss.backward()
+            self._accumulate_curvature_step()
+        self._divide_curvature()
+        self._update_center()
+
+    def compute_loss(self):
+        loss = 0.
+        for parameter in self.model.parameters():
+            ewc_state = self.ewc_state_dict[parameter]
+            loss += (ewc_state.G * torch.square(parameter - ewc_state.parameter)).sum()
+        return 0.5*loss
+
+    def merge_regularizer(self, old_state_dict):
+        old_importance = old_state_dict['importance']
+        self.importance = [x + y for x, y in zip(self.importance, old_importance)]
