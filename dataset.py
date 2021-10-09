@@ -9,6 +9,7 @@ from typing import NamedTuple, Any, Callable, List, Optional, Union, Tuple, Set
 from glob import glob
 import scipy.io
 import random
+import sklearn.utils
 
 
 def pil_loader(path: str) -> Image.Image:
@@ -372,8 +373,11 @@ class DataIncrementalTenfoldCIFAR100(datasets.CIFAR100):
     ) -> None:
         super().__init__(root, train=train, transform=transform,
                         target_transform=target_transform, download=download)
+        self.data = np.array(self.data)
+        self.targets = np.array(self.targets)
+        sklearn.utils.shuffle(self.data, self.targets, random_state=123)
         self.data = np.split(self.data, 10)[task_id]
-        self.targets = np.split(np.array(self.targets), 10)[task_id]
+        self.targets = np.split(self.targets, 10)[task_id]
 
 
 class TaskIncrementalTenfoldImageNet(datasets.ImageNet):
