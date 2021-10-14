@@ -18,7 +18,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from utils import MultiEpochsDataLoader
 from dataset import TaskIncrementalTenfoldCIFAR100
 import shutil
-from kfac import KFACRegularizer, EWCRegularizer
+from kfac import KFACRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
 
@@ -48,7 +48,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_73'
+    LOG_DIR = '/workspace/runs/torch_rbu_cifar_68'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-5
@@ -133,6 +133,62 @@ class CustomMSELoss(nn.MSELoss):
 
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return 0.5*F.mse_loss(input, target, reduction=self.reduction)
+
+
+class EWC:
+    def __init__(self, model: nn.Module, criterion: nn.Module):
+        self.model = model
+        self.criterion = criterion
+        self._reset_state()
+
+    def _reset_state(self):
+        self.importance = [torch.zeros_like(param) for param in self.model.parameters()]
+        self.center = [torch.zeros_like(param) for param in self.model.parameters()]
+
+    def _accumulate_curvature_step(self):
+        for m_param, ewc_param in zip(self.model.parameters(), self.importance):
+            ewc_param.add_(m_param.grad.data.square())
+
+    def _update_center(self):
+        self.center = [param.data.detach().clone() for param in self.model.parameters()]
+
+    def compute_curvature(self, dataset: torch.utils.data.Dataset, t, n_steps):
+        self._reset_state()
+        self.model.register_full_backward_hook(self._backward_hook)
+        data_loader_cycle = icycle(make_dataloader(dataset, False, True))
+        self.model.eval()
+        for _ in trange(n_steps):
+            input, _ = next(data_loader_cycle)
+            input = input.cuda()
+            self.model.zero_grad()
+            output = self.model(input)[t]
+            pseudo_target = torch.normal(output.detach()) #TODO
+            loss = self.criterion(output, pseudo_target).sum(-1).squeeze() #TODO
+            loss.backward()
+            self._accumulate_curvature_step()
+        for ewc_param in self.importance:
+            ewc_param.div_(n_steps)
+        self._update_center()
+
+    def compute_loss(self):
+        loss = 0.
+        for i, p, c in zip(self.importance, self.model.parameters(), self.center):
+            loss += (i * torch.square(p - c)).sum()
+        return 0.5*loss
+
+    def merge_regularizer(self, old_state_dict):
+        old_importance = old_state_dict['importance']
+        self.importance = [x + y for x, y in zip(self.importance, old_importance)]
+
+    def state_dict(self):
+        return {
+            'importance': copy.deepcopy(self.importance),
+            'center': copy.deepcopy(self.center)
+        }
+
+    def load_state_dict(self, d: dict):
+        self.importance = d['importance']
+        self.center = d['center']
 
 
 class LWF:
@@ -258,41 +314,41 @@ def main():
 
     update_batchnorm()
 
-    train_loader_list = [icycle(make_dataloader(dset, True)) for dset in train_dataset_sequence]
-    for t in trange(len(train_dataset_sequence)):
-        optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
-        lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_STEP))
+    train_loader_sequence = [make_dataloader(dset, train=True) for dset in train_dataset_sequence]
+    train_loader_sequence_cycle = [icycle(x) for x in train_loader_sequence]
+    optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
+    lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(len(train_dataset_sequence)*FLAGS.MAX_STEP))
 
-        model.eval()
-        for i in range(max_step := FLAGS.MAX_STEP):
-            optimizer.zero_grad()
+    model.eval()
+    for i in (pbar := trange(len(train_dataset_sequence)*FLAGS.MAX_STEP)):
+        t = i%10
 
-            for j in range(t+1):
-                train_loader = train_loader_list[j]
-                input, target = next(train_loader)
-                input = input.cuda()
-                target = target.cuda()
-                output = model(input)
-                mse_loss = criterion(output[j], 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
-                loss = mse_loss / (t+1)
-                loss.backward()
-            # weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
-            weight_decay_origin(model.module, FLAGS.WEIGHT_DECAY)
-            optimizer.step()
-            lr_scheduler.step()
+        optimizer.zero_grad()
+        loader = train_loader_sequence_cycle[t]
+        input, target = next(loader)
+        input = input.cuda()
+        target = target.cuda()
+        output = model(input)
+        mse_loss = criterion(output[t], 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
+        loss = mse_loss
+        loss.backward()
 
-            if global_step%100 == 0:
-                tprint(f'[TRAIN][{i}/{max_step}] LR {lr_scheduler.get_last_lr()[-1]:.2e} | {mse_loss.cpu().item():.3f}')
-                summary_writer.add_scalar('lr', lr_scheduler.get_last_lr()[-1], global_step=global_step)
+        # weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
+        weight_decay_origin(model.module, FLAGS.WEIGHT_DECAY)
 
-            if global_step%500 == 0:
-                evaluate_sequence(t)
+        optimizer.step()
+        lr_scheduler.step()
 
-            global_step += 1
+        if global_step%100 == 0:
+            tprint(f'[TRAIN][{i}/{len(pbar)}] LR {lr_scheduler.get_last_lr()[-1]:.2e} | {mse_loss.cpu().item():.3f}')
+            summary_writer.add_scalar('lr', lr_scheduler.get_last_lr()[-1], global_step=global_step)
 
-        evaluate_sequence(t)
+        if global_step%500 == 0:
+            evaluate_sequence(9)
 
+        global_step += 1
 
+    evaluate_sequence(9)
 
     if FLAGS.SAVE:
         save_pickle()

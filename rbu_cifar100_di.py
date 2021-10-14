@@ -16,7 +16,7 @@ from PIL import Image
 import copy
 from torch.utils.tensorboard.writer import SummaryWriter
 from utils import MultiEpochsDataLoader
-from dataset import TaskIncrementalTenfoldCIFAR100
+from dataset import DataIncrementalTenfoldCIFAR100, DataIncrementalHundredfoldCIFAR100
 import shutil
 from kfac import KFACRegularizer, EWCRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
@@ -48,15 +48,18 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_73'
+    LOG_DIR = '/workspace/runs/torch_rbu_cifar_87'
     BATCH_SIZE = 128
-    INIT_LR = 1e-4
-    WEIGHT_DECAY = 1e-5
+    # INIT_LR = 1e-4
+    # WEIGHT_DECAY = 1e-5
+    INIT_LR = 1e-3
+    WEIGHT_DECAY = 1e-4
     # WEIGHT_DECAY = 0
     MAX_STEP = 8000
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
+    METHOD = None
 
 
 if FLAGS.SAVE:
@@ -81,10 +84,14 @@ def weight_decay(named_parameters, lam):
 
 def weight_decay_origin(model: nn.Module, lam: float = 1e-4):
     for module in model.modules():
-        if isinstance(module, (CustomLinear, CustomConv2d)):
+        if type(module) in (CustomLinear, CustomConv2d):
             module.weight_tangent.grad.data.add_(module.weight.data + module.weight_tangent.data, alpha=lam)
             if module.bias_tangent is not None:
                 module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
+        elif type(module) in (nn.Linear, nn.Conv2d):
+            module.weight.grad.data.add_(module.weight.data, alpha=lam)
+            if module.bias is not None:
+                module.bias.grad.data.add_(module.bias.data, alpha=lam)
 
 
 # maybe regularize weights only?
@@ -120,11 +127,17 @@ class MultiHeadWrapper(nn.Module):
         super().__init__()
         self.module = module
         self.heads = nn.ModuleList([nn.Linear(in_features, out_features) for _ in range(n_heads)])
-        self.head = None
+        self.t = None
+
+    def set_head(self, t: int):
+        self.t = t
 
     def forward(self, x):
         x = self.module(x)
-        return [head(x) for head in self.heads]
+        if self.t is None:
+            return [head(x) for head in self.heads]
+        else:
+            return self.heads[self.t](x)
 
 
 class CustomMSELoss(nn.MSELoss):
@@ -140,10 +153,10 @@ class LWF:
         self.teacher_model = copy.deepcopy(teacher_model)
         self.criterion = criterion
 
-    def compute_loss(self, input: list, pred: list, t: int):
+    def compute_loss(self, input: torch.Tensor, pred: torch.Tensor):
         with torch.no_grad():
             target = self.teacher_model(input)
-        loss = sum(self.criterion(pred[i], target[i]).sum(-1).mean() for i in range(t))
+        loss = self.criterion(pred, target).sum(-1).mean()
         return loss
 
 
@@ -184,15 +197,14 @@ def main():
     # num_classes = 10
     # target_transform = get_target_transform_fn(num_classes=num_classes, alpha=15.0)
 
-    train_dataset_sequence = [TaskIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(10)]
-    # train_dataset_sequence = [TaskIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train if i%2==0 else transform_train_jittered) for i in range(10)]
-    test_dataset_sequence = [TaskIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=False, transform=transform_test) for i in range(10)]
-    test_loader_sequence = [make_dataloader(dset, train=False) for dset in test_dataset_sequence]
+    train_dataset_sequence = [DataIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(10)]
+    # train_dataset_sequence = [DataIncrementalHundredfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(100)]
+    test_dataset = datasets.CIFAR100(FLAGS.DATA_ROOT, train=False, transform=transform_test)
+    test_loader = make_dataloader(test_dataset, train=False)
 
-    model = resnet18(num_classes=0)
+    model = resnet18(num_classes=100)
     state_dict = torch.load(os.path.join(FLAGS.CHECKPOINT_DIR, 'state_dict.pt'))
     model.load_state_dict(state_dict, strict=False)
-    model = MultiHeadWrapper(model, 10, 512, 10)
     model.cuda()
 
     # freeze_parameters(model.module)
@@ -213,38 +225,22 @@ def main():
             model(input)
 
     @torch.no_grad()
-    def evaluate(data_loader, t):
+    def evaluate(data_loader):
         losses = []
         corrects = []
         model.eval()
         for input, target in data_loader:
             input = input.cuda()
             target = target.cuda()
-            output = model(input)[t]
-            loss = criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1)
+            output = model(input)
+            loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1)
             losses.append(loss.view(-1))
             corrects.append((target == output.max(-1).indices).view(-1))
         avg_loss = torch.cat(losses).mean().item()
         avg_acc = torch.cat(corrects).float().mean().item()*100
-        return {
-            'loss': avg_loss,
-            'acc': avg_acc,
-        }
-
-    def evaluate_sequence(current_t):
-        losses = dict()
-        accs = dict()
-        for t in range(current_t+1):
-            data_loader = test_loader_sequence[t]
-            summary = evaluate(data_loader, t)
-            losses[str(t)] = summary['loss']
-            accs[str(t)] = summary['acc']
-            tprint(f"[TEST] loss {summary['loss']:.3f} | T1acc {summary['acc']:.2f}")
-        if FLAGS.SAVE:
-            summary_writer.add_scalars('test_loss/per_task', losses, global_step=global_step)
-            summary_writer.add_scalars('test_acc/per_task', accs, global_step=global_step)
-            summary_writer.add_scalar('test_loss/avg', np.mean(list(losses.values())), global_step=global_step)
-            summary_writer.add_scalar('test_acc/avg', np.mean(list(accs.values())), global_step=global_step)
+        summary_writer.add_scalar('test_loss', avg_loss, global_step=global_step)
+        summary_writer.add_scalar('test_acc', avg_acc, global_step=global_step)
+        tprint(f"[TEST] loss {avg_loss:.3f} | T1acc {avg_acc:.2f}")
 
     def save_pickle():
         pickle = model.state_dict()
@@ -258,40 +254,99 @@ def main():
 
     update_batchnorm()
 
-    train_loader_list = [icycle(make_dataloader(dset, True)) for dset in train_dataset_sequence]
+    # regularizer = EWCRegularizer(model.module, criterion)
+    regularizer_list = []
+
     for t in trange(len(train_dataset_sequence)):
+        train_loader = make_dataloader(train_dataset_sequence[t], True)
+        train_loader_cycle = icycle(train_loader)
         optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
         lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_STEP))
 
+        if FLAGS.METHOD == 'LWF':
+            regularizer = LWF(model, criterion)
+        elif FLAGS.METHOD == 'LWF+KFAC':
+            regularizer_lwf = LWF(model, criterion)
+        elif FLAGS.METHOD == 'LWF+EWC':
+            regularizer_lwf = LWF(model, criterion)
+
         model.eval()
         for i in range(max_step := FLAGS.MAX_STEP):
+            input, target = next(train_loader_cycle)
+            input = input.cuda()
+            target = target.cuda()
             optimizer.zero_grad()
+            output = model(input)
+            mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
 
-            for j in range(t+1):
-                train_loader = train_loader_list[j]
-                input, target = next(train_loader)
-                input = input.cuda()
-                target = target.cuda()
-                output = model(input)
-                mse_loss = criterion(output[j], 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
-                loss = mse_loss / (t+1)
-                loss.backward()
+            if FLAGS.METHOD == 'LWF':
+                reg_loss = regularizer.compute_loss(input, output)
+                loss = (mse_loss + reg_loss*t)/(t+1)
+            elif FLAGS.METHOD == 'EWC':
+                # reg_loss = regularizer.compute_loss()
+                reg_loss = sum(r.compute_loss() for r in regularizer_list) * 1.0
+                loss = (mse_loss + reg_loss)/(t+1)
+            elif FLAGS.METHOD == 'KFAC':
+                reg_loss = sum(r.compute_loss() for r in regularizer_list)
+                loss = (mse_loss + reg_loss)/(t+1)
+            elif FLAGS.METHOD == 'LWF+KFAC':
+                reg_loss = regularizer_lwf.compute_loss(input, output, t) + sum(r.compute_loss() for r in regularizer_list)
+                reg_loss /= 2
+                loss = (mse_loss + reg_loss)/(t+1)
+            elif FLAGS.METHOD == 'LWF+EWC':
+                reg_loss = regularizer_lwf.compute_loss(input, output, t) + sum(r.compute_loss() for r in regularizer_list) * 1.0
+                reg_loss /= 2
+                loss = (mse_loss + reg_loss)/(t+1)
+            elif FLAGS.METHOD is None:
+                reg_loss = 0.
+                loss = mse_loss
+            else:
+                raise NotImplementedError(FLAGS.METHOD)
+            # loss = mse_loss
+            loss.backward()
             # weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
-            weight_decay_origin(model.module, FLAGS.WEIGHT_DECAY)
+            weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
             optimizer.step()
             lr_scheduler.step()
 
             if global_step%100 == 0:
-                tprint(f'[TRAIN][{i}/{max_step}] LR {lr_scheduler.get_last_lr()[-1]:.2e} | {mse_loss.cpu().item():.3f}')
+                tprint(f'[TRAIN][{i}/{max_step}] LR {lr_scheduler.get_last_lr()[-1]:.2e} | {mse_loss.cpu().item():.3f} | {reg_loss:.3f}')
                 summary_writer.add_scalar('lr', lr_scheduler.get_last_lr()[-1], global_step=global_step)
 
             if global_step%500 == 0:
-                evaluate_sequence(t)
+                evaluate(test_loader)
 
             global_step += 1
 
-        evaluate_sequence(t)
+        evaluate(test_loader)
 
+
+        if FLAGS.METHOD == 'EWC':
+            # compute ewc state
+            # old_ewc_state = regularizer.state_dict()
+            # regularizer.compute_curvature(train_dataset_sequence[t], t, n_steps=10000)
+            # regularizer.merge_regularizer(old_ewc_state)
+
+            # compute ewc state
+            regularizer = EWCRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
+            regularizer.compute_curvature(train_dataset_sequence[t], n_steps=1000) # TODO: not fair becuase of batch sizes
+            regularizer_list.append(regularizer)
+
+        if FLAGS.METHOD == 'KFAC':
+            # compute kfac state
+            regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
+            regularizer.compute_curvature(train_dataset_sequence[t], n_steps=1000)
+            regularizer_list.append(regularizer)
+
+        elif FLAGS.METHOD == 'LWF+KFAC':
+            regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
+            regularizer.compute_curvature(train_dataset_sequence[t], n_steps=1000)
+            regularizer_list.append(regularizer)
+
+        elif FLAGS.METHOD == 'LWF+EWC':
+            regularizer = EWCRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
+            regularizer.compute_curvature(train_dataset_sequence[t], n_steps=1000)
+            regularizer_list.append(regularizer)
 
 
     if FLAGS.SAVE:

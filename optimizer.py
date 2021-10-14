@@ -10,6 +10,9 @@ from utils import icycle, MultiEpochsDataLoader
 from dataclasses import dataclass
 from collections import OrderedDict
 from torch import optim
+import torch
+from . import _functional as F
+from torch.optim.optimizer import Optimizer
 
 @dataclass
 class KFACState:
@@ -24,6 +27,98 @@ class EWCState:
     G: torch.Tensor = None
     parameter: torch.Tensor = None
 
+
+class KfacOptimizer(Optimizer):
+    r"""
+    Args:
+        params (iterable): iterable of parameters to optimize or dicts defining
+            parameter groups
+        lr (float, optional): learning rate (default: 1e-3)
+        betas (Tuple[float, float], optional): coefficients used for computing
+            running averages of gradient and its square (default: (0.9, 0.999))
+        eps (float, optional): term added to the denominator to improve
+            numerical stability (default: 1e-8)
+        weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
+        amsgrad (boolean, optional): whether to use the AMSGrad variant of this
+            algorithm from the paper `On the Convergence of Adam and Beyond`_
+            (default: False)
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, amsgrad=False):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, amsgrad=amsgrad)
+        super().__init__(params, defaults)
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for group in self.param_groups:
+            group.setdefault('amsgrad', False)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Performs a single optimization step.
+
+        Args:
+            closure (callable, optional): A closure that reevaluates the model
+                and returns the loss.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad = []
+            grads = []
+            exp_avgs = []
+            exp_avg_sqs = []
+            state_sums = []
+            max_exp_avg_sqs = []
+            state_steps = []
+
+            for p in group['params']:
+                if p.grad is not None:
+                    params_with_grad.append(p)
+                    if p.grad.is_sparse:
+                        raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
+                    grads.append(p.grad)
+
+                    state = self.state[p]
+                    # Lazy state initialization
+                    if len(state) == 0:
+                        state['step'] = 0
+                        # Exponential moving average of gradient values
+                        state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                        # Exponential moving average of squared gradient values
+                        state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                        if group['amsgrad']:
+                            # Maintains max of all exp. moving avg. of sq. grad. values
+                            state['max_exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                    exp_avgs.append(state['exp_avg'])
+                    exp_avg_sqs.append(state['exp_avg_sq'])
+
+                    if group['amsgrad']:
+                        max_exp_avg_sqs.append(state['max_exp_avg_sq'])
+
+                    # update the steps for each param group update
+                    state['step'] += 1
+                    # record the step after step update
+                    state_steps.append(state['step'])
+
+            beta1, beta2 = group['betas']
+            F.adam(params_with_grad,
+                   grads,
+                   exp_avgs,
+                   exp_avg_sqs,
+                   max_exp_avg_sqs,
+                   state_steps,
+                   group['amsgrad'],
+                   beta1,
+                   beta2,
+                   group['lr'],
+                   group['weight_decay'],
+                   group['eps'])
+        return loss
 
 @torch.no_grad()
 def compute_A(module: nn.Module, a: torch.Tensor) -> torch.Tensor:
@@ -247,28 +342,6 @@ class KFACRegularizer:
         loss = sum(losses)
         return loss
 
-    # def train_dataset(self, dataset: Dataset, t: int, n_steps: int) -> None:
-    #     data_loader = MultiEpochsDataLoader(
-    #                         dataset,
-    #                         batch_size=64,
-    #                         shuffle=True,
-    #                         drop_last=True,
-    #                         num_workers=4,
-    #                     )
-    #     optimizer = optim.Adam(self.model.parameters(), lr=1e-5)
-    #     data_loader_cycle = icycle(data_loader)
-    #     self.init_state_dict = self.model.state_dict().copy()
-    #     self.model.eval()
-    #     for _ in trange(n_steps):
-    #         input, target = next(data_loader_cycle)
-    #         input = input.cuda()
-    #         self.model.zero_grad()
-    #         output = self.model(input)[t]
-    #         pseudo_target = torch.normal(output.detach())
-    #         loss = self.criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
-    #         loss.backward()
-
-
 
 
 def kfac_mvp(kfac_state: KFACState, vec: torch.Tensor) -> torch.Tensor:
@@ -357,68 +430,3 @@ class KFAC_penalty(torch.autograd.Function):
             grad_bias = None
         return None, grad_weight, grad_bias
 
-
-class EWCRegularizer:
-    def __init__(self, model: nn.Module, criterion: nn.Module):
-        self.model = model
-        self.criterion = criterion
-        self.ewc_state_dict : Mapping[nn.Parameter, EWCState] = OrderedDict()
-        self.n_steps = 0
-        self._reset_state()
-
-    def _reset_state(self):
-        for parameter in self.model.parameters():
-            self.ewc_state_dict[parameter] = EWCState(
-                G = torch.zeros_like(parameter),
-                parameter = None
-            )
-
-    def _accumulate_curvature_step(self):
-        for parameter in self.model.parameters():
-            self.ewc_state_dict[parameter].G.add_(parameter.grad.data.square())
-        self.n_steps += 1
-
-    def _update_center(self):
-        for parameter in self.model.parameters():
-            self.ewc_state_dict[parameter].parameter = parameter.detach().clone()
-
-    def _divide_curvature(self):
-        for ewc_state in self.ewc_state_dict.values():
-            ewc_state.G.div_(self.n_steps)
-
-    def compute_curvature(self, dataset: torch.utils.data.Dataset, n_steps, t = None):
-        self._reset_state()
-        data_loader = MultiEpochsDataLoader(
-                            dataset,
-                            batch_size=1,
-                            shuffle=True,
-                            drop_last=True,
-                            num_workers=4,
-                        )
-        data_loader_cycle = icycle(data_loader)
-        self.model.eval()
-        for _ in trange(n_steps):
-            input, _ = next(data_loader_cycle)
-            input = input.cuda()
-            self.model.zero_grad()
-            if t is not None:
-                output = self.model(input)[t]
-            else:
-                output = self.model(input)
-            pseudo_target = torch.normal(output.detach()) #TODO
-            loss = self.criterion(output, pseudo_target).sum(-1).squeeze() #TODO
-            loss.backward()
-            self._accumulate_curvature_step()
-        self._divide_curvature()
-        self._update_center()
-
-    def compute_loss(self):
-        loss = 0.
-        for parameter in self.model.parameters():
-            ewc_state = self.ewc_state_dict[parameter]
-            loss += (ewc_state.G * torch.square(parameter - ewc_state.parameter)).sum()
-        return 0.5*loss
-
-    def merge_regularizer(self, old_state_dict):
-        old_importance = old_state_dict['importance']
-        self.importance = [x + y for x, y in zip(self.importance, old_importance)]

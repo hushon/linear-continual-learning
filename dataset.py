@@ -328,40 +328,139 @@ class StanfordCars196(datasets.VisionDataset):
         return len(self.labels)
 
 
-class TaskIncrementalTenfoldCIFAR100(datasets.CIFAR100):
-    task_labels = [
-            [64, 67, 7, 75, 50, 84, 93, 87, 29, 63],
-            [1, 3, 9, 44, 45, 14, 28, 22, 24, 60],
-            [96, 35, 69, 10, 74, 12, 46, 15, 85, 54],
-            [39, 47, 81, 82, 83, 23, 56, 26, 91, 95],
-            [32, 38, 72, 41, 73, 80, 25, 58, 27, 62],
-            [33, 65, 70, 49, 51, 19, 21, 53, 59, 61],
-            [66, 2, 36, 37, 5, 77, 78, 16, 18, 30],
-            [0, 97, 40, 8, 76, 79, 55, 57, 92, 94],
-            [99, 42, 43, 17, 20, 86, 88, 89, 90, 31],
-            [98, 34, 68, 4, 6, 71, 11, 13, 48, 52]
-        ]
+# class TaskIncrementalTenfoldCIFAR100(datasets.CIFAR100):
+#     task_labels = [
+#             [64, 67, 7, 75, 50, 84, 93, 87, 29, 63],
+#             [1, 3, 9, 44, 45, 14, 28, 22, 24, 60],
+#             [96, 35, 69, 10, 74, 12, 46, 15, 85, 54],
+#             [39, 47, 81, 82, 83, 23, 56, 26, 91, 95],
+#             [32, 38, 72, 41, 73, 80, 25, 58, 27, 62],
+#             [33, 65, 70, 49, 51, 19, 21, 53, 59, 61],
+#             [66, 2, 36, 37, 5, 77, 78, 16, 18, 30],
+#             [0, 97, 40, 8, 76, 79, 55, 57, 92, 94],
+#             [99, 42, 43, 17, 20, 86, 88, 89, 90, 31],
+#             [98, 34, 68, 4, 6, 71, 11, 13, 48, 52]
+#         ]
+#     def __init__(
+#             self,
+#             root: str,
+#             task_id: int,
+#             train: bool = True,
+#             transform = None,
+#             target_transform = None,
+#             download: bool = False,
+#     ) -> None:
+#         super().__init__(root, train=train, transform=transform,
+#                         target_transform=target_transform, download=download)
+#         label_set = self.task_labels[task_id]
+#         lut = {v: i for i, v in enumerate(label_set)}
+#         mask = np.isin(self.targets, label_set)
+
+#         self.data = np.array(self.data)[mask]
+#         self.targets = np.array(self.targets)[mask]
+#         self.targets = np.array([lut[k] for k in self.targets])
+
+
+class TaskIncrementalTenfoldCIFAR100(datasets.VisionDataset):
+    base_folder = 'cifar-100-python-tenfold_ti'
+    train_list = ['train'+str(i)+'.npz' for i in range(10)]
+    test_list = ['test'+str(i)+'.npz' for i in range(10)]
+
     def __init__(
             self,
             root: str,
             task_id: int,
             train: bool = True,
             transform = None,
-            target_transform = None,
-            download: bool = False,
+            target_transform = None
     ) -> None:
-        super().__init__(root, train=train, transform=transform,
-                        target_transform=target_transform, download=download)
-        label_set = self.task_labels[task_id]
-        lut = {v: i for i, v in enumerate(label_set)}
-        mask = np.isin(self.targets, label_set)
+        super().__init__(root, transform=transform, target_transform=target_transform)
+        self.train = train
+        self.task_id = task_id
 
-        self.data = np.array(self.data)[mask]
-        self.targets = np.array(self.targets)[mask]
-        self.targets = np.array([lut[k] for k in self.targets])
+        if train:
+            filename = self.train_list[self.task_id]
+        else:
+            filename = self.test_list[self.task_id]
+        entry = np.load(os.path.join(self.root, self.base_folder, filename))
+        self.data = entry['data']
+        self.targets = entry['labels']
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            tuple: (image, target) where target is index of the target class.
+        """
+        img, target = self.data[index], self.targets[index]
+
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        img = Image.fromarray(img)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return img, target
+
+    def __len__(self) -> None:
+        return len(self.targets)
 
 
-class DataIncrementalTenfoldCIFAR100(datasets.CIFAR100):
+# class DataIncrementalTenfoldCIFAR100(datasets.CIFAR100):
+#     def __init__(
+#             self,
+#             root: str,
+#             task_id: int,
+#             train: bool = True,
+#             transform: Optional[Callable] = None,
+#             target_transform: Optional[Callable] = None,
+#             download: bool = False,
+#     ) -> None:
+#         super().__init__(root, train=train, transform=transform,
+#                         target_transform=target_transform, download=download)
+#         assert isinstance(task_id, int) and 0 <= task_id < 10
+#         self.data = np.asarray(self.data)
+#         self.targets = np.asarray(self.targets)
+#         # sklearn.utils.shuffle(self.data, self.targets, random_state=123)
+#         # self.data = np.split(self.data, 10)[task_id]
+#         # self.targets = np.split(self.targets, 10)[task_id]
+#         n = len(self.targets) // 10
+#         self.data = self.data[task_id*n : (task_id+1)*n]
+#         self.targets = self.targets[task_id*n : (task_id+1)*n]
+
+
+# class DataIncrementalHundredfoldCIFAR100(datasets.CIFAR100):
+#     def __init__(
+#             self,
+#             root: str,
+#             task_id: int,
+#             train: bool = True,
+#             transform: Optional[Callable] = None,
+#             target_transform: Optional[Callable] = None,
+#             download: bool = False,
+#     ) -> None:
+#         super().__init__(root, train=train, transform=transform,
+#                         target_transform=target_transform, download=download)
+#         assert isinstance(task_id, int) and 0 <= task_id < 100
+#         self.data = np.asarray(self.data)
+#         self.targets = np.asarray(self.targets)
+#         # sklearn.utils.shuffle(self.data, self.targets, random_state=123)
+#         # self.data = np.split(self.data, 100)[task_id]
+#         # self.targets = np.split(self.targets, 100)[task_id]
+#         n = len(self.targets) // 100
+#         self.data = self.data[task_id*n : (task_id+1)*n]
+#         self.targets = self.targets[task_id*n : (task_id+1)*n]
+
+class DataIncrementalTenfoldCIFAR100(datasets.VisionDataset):
+    base_folder = 'cifar-100-python-tenfold_di'
+    train_list = ['train'+str(i)+'.npz' for i in range(10)]
+
     def __init__(
             self,
             root: str,
@@ -369,15 +468,88 @@ class DataIncrementalTenfoldCIFAR100(datasets.CIFAR100):
             train: bool = True,
             transform: Optional[Callable] = None,
             target_transform: Optional[Callable] = None,
-            download: bool = False,
     ) -> None:
-        super().__init__(root, train=train, transform=transform,
-                        target_transform=target_transform, download=download)
-        self.data = np.array(self.data)
-        self.targets = np.array(self.targets)
-        sklearn.utils.shuffle(self.data, self.targets, random_state=123)
-        self.data = np.split(self.data, 10)[task_id]
-        self.targets = np.split(self.targets, 10)[task_id]
+        super().__init__(root, transform=transform, target_transform=target_transform)
+        assert train == True
+        self.train = train
+        self.task_id = task_id
+
+        filename = self.train_list[self.task_id]
+        entry = np.load(os.path.join(self.root, self.base_folder, filename))
+        self.data = entry['data']
+        self.targets = entry['labels']
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            tuple: (image, target) where target is index of the target class.
+        """
+        img, target = self.data[index], self.targets[index]
+
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        img = Image.fromarray(img)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return img, target
+
+    def __len__(self) -> None:
+        return len(self.targets)
+
+class DataIncrementalHundredfoldCIFAR100(datasets.VisionDataset):
+    base_folder = 'cifar-100-python-hundredfold_di'
+    train_list = ['train'+str(i)+'.npz' for i in range(100)]
+
+    def __init__(
+            self,
+            root: str,
+            task_id: int,
+            train: bool = True,
+            transform: Optional[Callable] = None,
+            target_transform: Optional[Callable] = None,
+    ) -> None:
+        super().__init__(root, transform=transform, target_transform=target_transform)
+        assert train == True
+        self.train = train
+        self.task_id = task_id
+
+        filename = self.train_list[self.task_id]
+        entry = np.load(os.path.join(self.root, self.base_folder, filename))
+        self.data = entry['data']
+        self.targets = entry['labels']
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        """
+        Args:
+            index (int): Index
+
+        Returns:
+            tuple: (image, target) where target is index of the target class.
+        """
+        img, target = self.data[index], self.targets[index]
+
+        # doing this so that it is consistent with all other datasets
+        # to return a PIL Image
+        img = Image.fromarray(img)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return img, target
+
+    def __len__(self) -> None:
+        return len(self.targets)
 
 
 class TaskIncrementalTenfoldImageNet(datasets.ImageNet):
