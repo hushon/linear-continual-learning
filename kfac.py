@@ -247,48 +247,19 @@ class KFACRegularizer:
         loss = sum(losses)
         return loss
 
-    # def train_dataset(self, dataset: Dataset, t: int, n_steps: int) -> None:
-    #     data_loader = MultiEpochsDataLoader(
-    #                         dataset,
-    #                         batch_size=64,
-    #                         shuffle=True,
-    #                         drop_last=True,
-    #                         num_workers=4,
-    #                     )
-    #     optimizer = optim.Adam(self.model.parameters(), lr=1e-5)
-    #     data_loader_cycle = icycle(data_loader)
-    #     self.init_state_dict = self.model.state_dict().copy()
-    #     self.model.eval()
-    #     for _ in trange(n_steps):
-    #         input, target = next(data_loader_cycle)
-    #         input = input.cuda()
-    #         self.model.zero_grad()
-    #         output = self.model(input)[t]
-    #         pseudo_target = torch.normal(output.detach())
-    #         loss = self.criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
-    #         loss.backward()
 
-
-
-
-def kfac_mvp(kfac_state: KFACState, vec: torch.Tensor) -> torch.Tensor:
+def kfac_mvp(A: torch.Tensor, B: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
     """Computes the matrix-vector product, where the matrix is factorized by a Kronecker product.
     Uses 'vec trick' to compute the product efficiently.
 
-    Args:
-        kfac_state (KFACState): A Kronecker-factored matrix
-        vector (torch.Tensor): A vector
-
     Returns:
-        torch.Tensor: Matrix-vector product
+        torch.Tensor: Matrix-vector product (A⊗B)v
     """
-
-    S = kfac_state.S
-    A = kfac_state.A
-    m, n = S.shape
-    p, q = A.shape
-    V = vec.view(n, p)
-    mvp = torch.chain_matmul(S, V, A) # (m, q)
+    # (A⊗B)v = vec(BVA')
+    m, n = A.shape
+    p, q = B.shape
+    V = vec.view(q, n)
+    mvp = torch.chain_matmul(B, V, A.T) # (p, m)
     return mvp.view(-1)
 
 
