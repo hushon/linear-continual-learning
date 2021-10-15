@@ -5,48 +5,11 @@ import torch.utils.data
 import PIL.Image
 import logging
 from tqdm import tqdm
-import jax
-import jax.numpy as jnp
-import jax.tree_util
 import tree
 from simplejpeg import decode_jpeg
 from PIL import Image
-
-
-def uint8_to_float(input: jnp.ndarray, mean: Tuple, std: Tuple) -> jnp.ndarray:
-    assert input.ndim == 4
-    input = input.astype(jnp.float32) / 255.0
-    mean = jnp.array(mean).reshape(1, 1, 1, -1)
-    std = jnp.array(std).reshape(1, 1, 1, -1)
-    input = (input - mean) / std
-    return input
-
-
-def image_loader(path: str) -> np.ndarray:
-    try:
-        with open(path, 'rb') as fp:
-            image = decode_jpeg(fp.read(), colorspace='RGB')
-    except:
-        image = Image.open(path).convert('RGB')
-        image = np.asarray(image)
-    return image
-
-def softmax_cross_entropy(logits: jnp.ndarray, labels: jnp.ndarray) -> jnp.ndarray:
-    logp = jax.nn.log_softmax(logits)
-    loss = -jnp.take_along_axis(logp, labels[:, None], axis=-1)
-    return loss
-
-def correct_topk(logits: jnp.ndarray, labels: jnp.ndarray, k: int) -> jnp.ndarray:
-    labels = labels[..., None]
-    preds = jnp.argsort(logits, axis=-1)[..., -k:]
-    return jnp.any(preds == labels, axis=-1)
-
-
-def l2_loss(params) -> jnp.ndarray:
-    # l2_params = jax.tree_util.tree_leaves(params)
-    l2_params = [p for ((mod_name, _), p) in tree.flatten_with_path(
-        params) if 'batchnorm' not in mod_name]
-    return 0.5 * sum(jnp.sum(jnp.square(p)) for p in l2_params)
+from torch import nn
+import torch.nn.functional as F
 
 
 def get_logger(log_path, level=logging.INFO):
@@ -130,48 +93,9 @@ class _RepeatSampler(object):
             yield from iter(self.sampler)
 
 
-def numpy_collate(batch):
-    if isinstance(batch[0], np.ndarray):
-        return np.stack(batch)
-    elif isinstance(batch[0], (tuple, list)):
-        transposed = zip(*batch)
-        return [numpy_collate(samples) for samples in transposed]
-    else:
-        return np.array(batch)
+class CustomMSELoss(nn.MSELoss):
+    def __init__(self, size_average=None, reduce=None, reduction: str = 'mean') -> None:
+        super().__init__(size_average=size_average, reduce=reduce, reduction=reduction)
 
-
-class ArrayNormalize(torch.nn.Module):
-    def __init__(self, mean, std):
-        super().__init__()
-        self.mean = mean
-        self.std = std
-
-    def __call__(self, arr: np.ndarray) -> np.ndarray:
-        assert isinstance(
-            arr, np.ndarray), f'Input should be ndarray. Got {type(arr)}.'
-        assert arr.ndim >= 3, f'Expected array to be a image of size (..., H, W, C). Got {arr.shape}.'
-
-        dtype = arr.dtype
-        mean = np.asarray(self.mean, dtype=dtype)
-        std = np.asarray(self.std, dtype=dtype)
-        if (std == 0).any():
-            raise ValueError(
-                f'std evaluated to zero after conversion to {dtype}, leading to division by zero.')
-        if mean.ndim == 1:
-            mean = mean.reshape(1, 1, -1)
-        if std.ndim == 1:
-            std = std.reshape(1, 1, -1)
-        arr -= mean
-        arr /= std
-        return arr
-
-
-class ToArray(torch.nn.Module):
-    '''convert image to float and 0-1 range'''
-    dtype = np.float32
-
-    def __call__(self, x: PIL.Image.Image) -> np.ndarray:
-        assert isinstance(x, PIL.Image.Image)
-        x = np.asarray(x, dtype=self.dtype)
-        x /= 255.0
-        return x
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return 0.5*F.mse_loss(input, target, reduction=self.reduction)
