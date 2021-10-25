@@ -35,6 +35,7 @@ class CustomLinear(nn.Linear):
 
 class CustomLeakyReLU(nn.LeakyReLU):
     def __init__(self, negative_slope: float = 1e-2, inplace: bool = False) -> None:
+        assert inplace == False
         super().__init__(negative_slope=negative_slope, inplace=inplace)
 
     def forward(self, input, jvp):

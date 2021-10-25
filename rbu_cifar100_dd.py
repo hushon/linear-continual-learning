@@ -18,7 +18,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from utils import MultiEpochsDataLoader
 from dataset import DataIncrementalTenfoldCIFAR100, DataIncrementalHundredfoldCIFAR100
 import shutil
-from kfac import KFACRegularizer, EWCRegularizer
+from kfac import KFACRegularizer, EWCRegularizer, EKFACRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
 
@@ -253,7 +253,7 @@ def main():
     update_batchnorm()
 
     # regularizer = EWCRegularizer(model.module, criterion)
-    # regularizer_list = []
+    regularizer_list = []
     regularizer = None
 
     for t in trange(len(train_dataset_sequence)):
@@ -286,6 +286,13 @@ def main():
                 reg_loss = sum(r.compute_loss() for r in regularizer_list) * 1.0
                 loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'KFAC':
+                if regularizer is not None:
+                    reg_loss = regularizer.compute_loss()
+                    loss = (mse_loss + reg_loss*t)/(t+1)
+                else:
+                    reg_loss = 0.
+                    loss = mse_loss
+            elif FLAGS.METHOD == 'EKFAC':
                 if regularizer is not None:
                     reg_loss = regularizer.compute_loss()
                     loss = (mse_loss + reg_loss*t)/(t+1)
@@ -348,6 +355,14 @@ def main():
                     old_kfac_state.A = (old_kfac_state.A*t + new_kfac_state.A)/(t+1)
                     old_kfac_state.weight = new_kfac_state.weight
                     old_kfac_state.bias = new_kfac_state.bias
+
+        if FLAGS.METHOD == 'EKFAC':
+            regularizer = EKFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
+            regularizer.compute_curvature(train_dataset_sequence[t], n_steps=1000)
+            for module in regularizer.modules:
+                regularizer.ekfac_state_dict[module].weight = regularizer_list[-1].ekfac_state_dict[module].weight
+                regularizer.ekfac_state_dict[module].bias = regularizer_list[-1].ekfac_state_dict[module].bias
+            regularizer_list.append(regularizer)
 
         elif FLAGS.METHOD == 'LWF+KFAC':
             regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])

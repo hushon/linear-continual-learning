@@ -257,6 +257,9 @@ def main():
     # regularizer = EWCRegularizer(model.module, criterion)
     regularizer_list = []
 
+    if FLAGS.METHOD == 'ORACLE':
+        train_loader_list = [icycle(make_dataloader(dset, True)) for dset in train_dataset_sequence]
+
     for t in trange(len(train_dataset_sequence)):
         train_loader = make_dataloader(train_dataset_sequence[t], True)
         train_loader_cycle = icycle(train_loader)
@@ -272,38 +275,74 @@ def main():
 
         model.eval()
         for i in range(max_step := FLAGS.MAX_STEP):
-            input, target = next(train_loader_cycle)
-            input = input.cuda()
-            target = target.cuda()
             optimizer.zero_grad()
-            output = model(input)
-            mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
 
             if FLAGS.METHOD == 'LWF':
+                input, target = next(train_loader_cycle)
+                input = input.cuda()
+                target = target.cuda()
+                output = model(input)
+                mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
                 reg_loss = regularizer.compute_loss(input, output)
                 loss = (mse_loss + reg_loss*t)/(t+1)
+                loss.backward()
             elif FLAGS.METHOD == 'EWC':
+                input, target = next(train_loader_cycle)
+                input = input.cuda()
+                target = target.cuda()
+                output = model(input)
+                mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
                 # reg_loss = regularizer.compute_loss()
                 reg_loss = sum(r.compute_loss() for r in regularizer_list) * 1.0
                 loss = (mse_loss + reg_loss)/(t+1)
+                loss.backward()
             elif FLAGS.METHOD == 'KFAC':
+                input, target = next(train_loader_cycle)
+                input = input.cuda()
+                target = target.cuda()
+                output = model(input)
+                mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
                 reg_loss = sum(r.compute_loss() for r in regularizer_list)
                 loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'LWF+KFAC':
+                input, target = next(train_loader_cycle)
+                input = input.cuda()
+                target = target.cuda()
+                output = model(input)
+                mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
                 reg_loss = regularizer_lwf.compute_loss(input, output, t) + sum(r.compute_loss() for r in regularizer_list)
                 reg_loss /= 2
                 loss = (mse_loss + reg_loss)/(t+1)
+                loss.backward()
             elif FLAGS.METHOD == 'LWF+EWC':
+                input, target = next(train_loader_cycle)
+                input = input.cuda()
+                target = target.cuda()
+                output = model(input)
+                mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
                 reg_loss = regularizer_lwf.compute_loss(input, output, t) + sum(r.compute_loss() for r in regularizer_list) * 1.0
                 reg_loss /= 2
                 loss = (mse_loss + reg_loss)/(t+1)
+                loss.backward()
             elif FLAGS.METHOD is None:
+                input, target = next(train_loader_cycle)
+                input = input.cuda()
+                target = target.cuda()
+                output = model(input)
+                mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
                 reg_loss = 0.
                 loss = mse_loss
+                loss.backward()
+            elif FLAGS.METHOD == 'ORACLE':
+                for j in range(t+1):
+                    input, target = next(train_loader_list[j])
+                    input = input.cuda()
+                    target = target.cuda()
+                    output = model(input)
+                    mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
+                    (mse_loss/(t+1)).backward()
             else:
                 raise NotImplementedError(FLAGS.METHOD)
-            # loss = mse_loss
-            loss.backward()
             # weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
             weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
             optimizer.step()
