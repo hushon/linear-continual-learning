@@ -7,8 +7,8 @@ import os
 from tqdm import tqdm, trange
 import numpy as np
 import random
-# from models.resnet_cifar100_jvplrelu import resnet18, resnet50
-from models.resnet_cifar100_lrelu import resnet18, resnet50
+from models.resnet_cifar100_jvplrelu import resnet18, resnet50
+# from models.resnet_cifar100_lrelu import resnet18, resnet50
 from torch.nn.parallel import DataParallel
 from torchvision import datasets
 import atexit
@@ -18,9 +18,10 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from utils import MultiEpochsDataLoader
 from dataset import TaskIncrementalTenfoldCIFAR100
 import shutil
-from kfac import KFACRegularizer, EWCRegularizer
+from kfac import KFACRegularizer, EWCRegularizer, get_center_dict, EKFACRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
+from utils import get_log_dir
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -48,20 +49,18 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    # LOG_DIR = '/workspace/runs/torch_rbu_cifar_83'
+    LOG_DIR = '/workspace/runs'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-5
     # WEIGHT_DECAY = 0
-    MAX_STEP = 8000
+    MAX_STEP = 4000
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
     METHOD = 'KFAC'
 
 
-if FLAGS.SAVE:
-    shutil.copytree('./', FLAGS.LOG_DIR, dirs_exist_ok=False)
 
 
 def tprint(obj):
@@ -84,8 +83,8 @@ def weight_decay_origin(model: nn.Module, lam: float = 1e-4):
     for module in model.modules():
         if isinstance(module, (CustomLinear, CustomConv2d)):
             module.weight_tangent.grad.data.add_(module.weight.data + module.weight_tangent.data, alpha=lam)
-            if module.bias_tangent is not None:
-                module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
+            # if module.bias_tangent is not None:
+            #     module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
 
 
 # maybe regularize weights only?
@@ -162,6 +161,13 @@ def get_target_transform_fn(num_classes: int = 10, alpha: float = 15.0):
 
 
 def main():
+    log_dir = get_log_dir(FLAGS.LOG_DIR)
+    summary_writer = SummaryWriter(log_dir=log_dir, max_queue=1)
+    print(f"{log_dir=}")
+
+    if FLAGS.SAVE:
+        shutil.copytree('./', log_dir, dirs_exist_ok=True)
+
 
     transform_train = T.Compose([
         T.RandomCrop(32, padding=4),
@@ -207,7 +213,7 @@ def main():
         data_loader = make_dataloader(datasets.CIFAR100(FLAGS.DATA_ROOT, train=True, transform=transform_train), True)
         data_loader_cycle = icycle(data_loader)
         model.train()
-        for _ in trange(FLAGS.BN_UPDATE_STEPS):
+        for _ in trange(FLAGS.BN_UPDATE_STEPS, desc="update batchnorm"):
             input, _ = next(data_loader_cycle)
             input = input.cuda()
             model(input)
@@ -248,24 +254,25 @@ def main():
 
     def save_pickle():
         pickle = model.state_dict()
-        pickle_path = os.path.join(FLAGS.LOG_DIR, f'state_dict.pt')
+        pickle_path = os.path.join(log_dir, f'state_dict.pt')
         torch.save(pickle, pickle_path)
         tprint(f'[SAVE] Saved to {pickle_path}')
 
 
-    summary_writer = SummaryWriter(log_dir=FLAGS.LOG_DIR, max_queue=1)
     global_step = 0
 
     update_batchnorm()
 
     # regularizer = EWCRegularizer(model.module, criterion)
     regularizer_list = []
+    regularizer = None
 
     for t in trange(len(train_dataset_sequence)):
         train_loader = make_dataloader(train_dataset_sequence[t], True)
         train_loader_cycle = icycle(train_loader)
-        optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
-        lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_STEP))
+        optimizer = optim.Adam([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR)
+        # lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_STEP))
+        lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, FLAGS.MAX_STEP)
 
         if FLAGS.METHOD == 'LWF':
             regularizer = LWF(model, criterion)
@@ -289,7 +296,15 @@ def main():
                 # reg_loss = regularizer.compute_loss()
                 reg_loss = sum(r.compute_loss() for r in regularizer_list) * 1.0
             elif FLAGS.METHOD == 'KFAC':
-                reg_loss = sum(r.compute_loss() for r in regularizer_list)
+                if regularizer is not None:
+                    reg_loss = regularizer.compute_loss(center_dict) * t
+                else:
+                    reg_loss = 0.
+            elif FLAGS.METHOD == 'EKFAC':
+                if regularizer is not None:
+                    reg_loss = regularizer.compute_loss(center_dict) * t
+                else:
+                    reg_loss = 0.
             elif FLAGS.METHOD == 'LWF+KFAC':
                 lwf_loss = regularizer_lwf.compute_loss(input, output, t)
                 reg_loss = sum(r.compute_loss() for r in regularizer_list)
@@ -304,6 +319,7 @@ def main():
             loss.backward()
             # weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
             weight_decay_origin(model.module, FLAGS.WEIGHT_DECAY)
+            weight_decay(model.heads[t].named_parameters(), FLAGS.WEIGHT_DECAY)
             optimizer.step()
             lr_scheduler.step()
 
@@ -332,9 +348,44 @@ def main():
 
         if FLAGS.METHOD == 'KFAC':
             # compute kfac state
-            regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (CustomLinear, CustomConv2d, CustomBatchNorm2d))])
-            regularizer.compute_curvature(train_dataset_sequence[t], 1000, t)
-            regularizer_list.append(regularizer)
+            if regularizer is None:
+                regularizer = KFACRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                regularizer.compute_curvature(train_dataset_sequence[t], 1000, t, batch_size=128)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+            else:
+                new_regularizer = KFACRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                new_regularizer.compute_curvature(train_dataset_sequence[t], 1000, t, batch_size=128)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                for old_kfac_state, new_kfac_state in zip(regularizer.kfac_state_dict.values(), new_regularizer.kfac_state_dict.values()):
+                    old_kfac_state.S = (old_kfac_state.S*t + new_kfac_state.S)/(t+1)
+                    old_kfac_state.A = (old_kfac_state.A*t + new_kfac_state.A)/(t+1)
+
+
+        if FLAGS.METHOD == 'EKFAC':
+            # compute kfac state
+            if regularizer is None:
+                regularizer = EKFACRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d))])
+                regularizer.compute_curvature(train_dataset_sequence[t], 1000, t, batch_size=128)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d))])
+            else:
+                new_regularizer = EKFACRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d))])
+                new_regularizer.compute_curvature(train_dataset_sequence[t], 1000, t, batch_size=128)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d))])
+                for module in regularizer.modules:
+                    kfac_state = regularizer.kfac_state_dict[module]
+                    ekfac_state = regularizer.ekfac_state_dict[module]
+                    new_kfac_state = new_regularizer.kfac_state_dict[module]
+                    new_ekfac_state = new_regularizer.ekfac_state_dict[module]
+                    # update kfac A, S
+                    kfac_state.A = (kfac_state.A*t + new_kfac_state.A)/(t+1)
+                    kfac_state.S = (kfac_state.S*t + new_kfac_state.S)/(t+1)
+                    # update KFE
+                    ekfac_state.Q_A = torch.symeig(kfac_state.A, eigenvectors=True).eigenvectors
+                    ekfac_state.Q_S = torch.symeig(kfac_state.S, eigenvectors=True).eigenvectors
+                    # update scaling
+                    ekfac_state.scale = (ekfac_state.scale*t + new_ekfac_state.scale)/(t+1)
+                # del new_regularizer
+
 
         elif FLAGS.METHOD == 'LWF+KFAC':
             regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (CustomLinear, CustomConv2d, CustomBatchNorm2d))])

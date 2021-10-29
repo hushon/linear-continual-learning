@@ -18,9 +18,10 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from utils import MultiEpochsDataLoader
 from dataset import DataIncrementalTenfoldCIFAR100, DataIncrementalHundredfoldCIFAR100
 import shutil
-from kfac import KFACRegularizer, EWCRegularizer, EKFACRegularizer
+from kfac import KFACRegularizer, EWCRegularizer, EKFACRegularizer, get_center_dict
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
+from utils import get_log_dir
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -48,20 +49,16 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_89'
+    LOG_DIR = '/workspace/runs/torch_rbu_cifar_96'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-5
     # WEIGHT_DECAY = 0
-    MAX_STEP = 8000
+    MAX_STEP = 4000
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
-    METHOD = 'LWF'
-
-
-if FLAGS.SAVE:
-    shutil.copytree('./', FLAGS.LOG_DIR, dirs_exist_ok=False)
+    METHOD = 'EKFAC'
 
 
 def tprint(obj):
@@ -84,12 +81,12 @@ def weight_decay_origin(model: nn.Module, lam: float = 1e-4):
     for module in model.modules():
         if type(module) in (CustomLinear, CustomConv2d):
             module.weight_tangent.grad.data.add_(module.weight.data + module.weight_tangent.data, alpha=lam)
-            if module.bias_tangent is not None:
-                module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
+            # if module.bias_tangent is not None:
+            #     module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
         elif type(module) in (nn.Linear, nn.Conv2d):
             module.weight.grad.data.add_(module.weight.data, alpha=lam)
-            if module.bias is not None:
-                module.bias.grad.data.add_(module.bias.data, alpha=lam)
+            # if module.bias is not None:
+            #     module.bias.grad.data.add_(module.bias.data, alpha=lam)
 
 
 # maybe regularize weights only?
@@ -173,6 +170,11 @@ def get_target_transform_fn(num_classes: int = 10, alpha: float = 15.0):
 
 
 def main():
+    log_dir = get_log_dir(FLAGS.LOG_DIR)
+    summary_writer = SummaryWriter(log_dir=log_dir, max_queue=1)
+    print(f"{log_dir=}")
+    if FLAGS.SAVE:
+        shutil.copytree('./', FLAGS.LOG_DIR, dirs_exist_ok=True)
 
     transform_train = T.Compose([
         T.RandomCrop(32, padding=4),
@@ -247,7 +249,6 @@ def main():
         tprint(f'[SAVE] Saved to {pickle_path}')
 
 
-    summary_writer = SummaryWriter(log_dir=FLAGS.LOG_DIR, max_queue=1)
     global_step = 0
 
     update_batchnorm()
@@ -259,8 +260,10 @@ def main():
     for t in trange(len(train_dataset_sequence)):
         train_loader = make_dataloader(train_dataset_sequence[t], True)
         train_loader_cycle = icycle(train_loader)
-        optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
-        lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_STEP))
+        # optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
+        optimizer = optim.Adam([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR)
+        # lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_STEP))
+        lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, FLAGS.MAX_STEP)
 
         if FLAGS.METHOD == 'LWF':
             regularizer = LWF(model, criterion)
@@ -287,15 +290,15 @@ def main():
                 loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'KFAC':
                 if regularizer is not None:
-                    reg_loss = regularizer.compute_loss()
+                    reg_loss = regularizer.compute_loss(center_dict)
                     loss = (mse_loss + reg_loss*t)/(t+1)
                 else:
                     reg_loss = 0.
                     loss = mse_loss
             elif FLAGS.METHOD == 'EKFAC':
                 if regularizer is not None:
-                    reg_loss = regularizer.compute_loss()
-                    loss = (mse_loss + reg_loss*t)/(t+1)
+                    reg_loss = sum(r.compute_loss(center_dict) for r in regularizer_list)
+                    loss = (mse_loss + reg_loss)/(t+1)
                 else:
                     reg_loss = 0.
                     loss = mse_loss
@@ -314,8 +317,8 @@ def main():
                 raise NotImplementedError(FLAGS.METHOD)
             # loss = mse_loss
             loss.backward()
-            # weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
-            weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
+            weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
+            # weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
             optimizer.step()
             lr_scheduler.step()
 
@@ -345,24 +348,22 @@ def main():
         if FLAGS.METHOD == 'KFAC':
             # compute kfac state
             if regularizer is None:
-                regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
-                regularizer.compute_curvature(train_dataset_sequence[t], n_steps=1000)
+                regularizer = KFACRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                regularizer.compute_curvature(train_dataset_sequence[t], 1000, batch_size=128)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
             else:
-                new_regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
-                new_regularizer.compute_curvature(train_dataset_sequence[t], n_steps=1000)
+                new_regularizer = KFACRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                new_regularizer.compute_curvature(train_dataset_sequence[t], 1000, batch_size=128)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
                 for old_kfac_state, new_kfac_state in zip(regularizer.kfac_state_dict.values(), new_regularizer.kfac_state_dict.values()):
                     old_kfac_state.S = (old_kfac_state.S*t + new_kfac_state.S)/(t+1)
                     old_kfac_state.A = (old_kfac_state.A*t + new_kfac_state.A)/(t+1)
-                    old_kfac_state.weight = new_kfac_state.weight
-                    old_kfac_state.bias = new_kfac_state.bias
 
         if FLAGS.METHOD == 'EKFAC':
-            regularizer = EKFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
-            regularizer.compute_curvature(train_dataset_sequence[t], n_steps=1000)
-            for module in regularizer.modules:
-                regularizer.ekfac_state_dict[module].weight = regularizer_list[-1].ekfac_state_dict[module].weight
-                regularizer.ekfac_state_dict[module].bias = regularizer_list[-1].ekfac_state_dict[module].bias
+            regularizer = EKFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, CustomLinear, CustomConv2d))])
+            regularizer.compute_curvature(train_dataset_sequence[t], n_steps=500)
             regularizer_list.append(regularizer)
+            center_dict = get_center_dict([m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, CustomLinear, CustomConv2d))])
 
         elif FLAGS.METHOD == 'LWF+KFAC':
             regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
