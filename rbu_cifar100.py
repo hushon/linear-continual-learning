@@ -7,8 +7,8 @@ import os
 from tqdm import tqdm, trange
 import numpy as np
 import random
-from models.resnet_cifar100_jvplrelu import resnet18, resnet50
-# from models.resnet_cifar100_lrelu import resnet18, resnet50
+# from models.resnet_cifar100_jvplrelu import resnet18, resnet50
+from models.resnet_cifar100_lrelu import resnet18, resnet50
 from torch.nn.parallel import DataParallel
 from torchvision import datasets
 import atexit
@@ -21,7 +21,8 @@ import shutil
 from kfac import KFACRegularizer, EWCRegularizer, get_center_dict, EKFACRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
-from utils import get_log_dir
+from utils import get_log_dir, get_timestamp
+from regularizer import MASRegularizer
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -48,19 +49,18 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
-    CHECKPOINT_DIR = '/workspace/runs/temp111'
+    # CHECKPOINT_DIR = '/workspace/runs/temp111' # ImageNet32, ResNet18 pretrained
+    CHECKPOINT_DIR = '/workspace/runs/pretrain_tinyimagenet_resnet18' # TinyImageNet, ResNet18 pretrained
     LOG_DIR = '/workspace/runs'
     BATCH_SIZE = 128
-    INIT_LR = 1e-4
+    INIT_LR = 1e-3
     WEIGHT_DECAY = 1e-5
     # WEIGHT_DECAY = 0
     MAX_STEP = 4000
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
-    METHOD = 'KFAC'
-
-
+    METHOD = 'MAS'
 
 
 def tprint(obj):
@@ -81,7 +81,11 @@ def weight_decay(named_parameters, lam):
 
 def weight_decay_origin(model: nn.Module, lam: float = 1e-4):
     for module in model.modules():
-        if isinstance(module, (CustomLinear, CustomConv2d)):
+        if type(module) in (nn.Linear, nn.Conv2d):
+            module.weight.grad.data.add_(module.weight.data, alpha=lam)
+            # if module.bias is not None:
+            #     module.bias.grad.data.add_(module.bias.data, alpha=lam)
+        elif type(module) in (CustomLinear, CustomConv2d):
             module.weight_tangent.grad.data.add_(module.weight.data + module.weight_tangent.data, alpha=lam)
             # if module.bias_tangent is not None:
             #     module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
@@ -142,9 +146,12 @@ class LWF:
     def compute_loss(self, input: list, pred: list, t: int):
         with torch.no_grad():
             target = self.teacher_model(input)
+
+        if type(self.criterion) == nn.KLDivLoss:
+            pred = [x.log_softmax(1) for x in pred]
+            target = [x.softmax(1) for x in target]
         loss = sum(self.criterion(pred[i], target[i]).sum(-1).mean() for i in range(t))
         return loss
-
 
 def initialize_model(model: MultiHeadWrapper, sample_input: torch.Tensor):
     output = model(sample_input)
@@ -161,7 +168,7 @@ def get_target_transform_fn(num_classes: int = 10, alpha: float = 15.0):
 
 
 def main():
-    log_dir = get_log_dir(FLAGS.LOG_DIR)
+    log_dir = os.path.join(FLAGS.LOG_DIR, get_timestamp())
     summary_writer = SummaryWriter(log_dir=log_dir, max_queue=1)
     print(f"{log_dir=}")
 
@@ -206,7 +213,10 @@ def main():
     # initialize grad attributes to zeros
     initialize_model(model, torch.zeros((1, 3, 32, 32), device='cuda'))
 
-    criterion = CustomMSELoss(reduction='none')
+    if FLAGS.METHOD in ('LWF', 'MAS', None):
+        criterion = nn.CrossEntropyLoss(reduction='none')
+    else:
+        criterion = CustomMSELoss(reduction='none')
 
     @torch.no_grad()
     def update_batchnorm():
@@ -227,7 +237,10 @@ def main():
             input = input.cuda()
             target = target.cuda()
             output = model(input)[t]
-            loss = criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1)
+            if FLAGS.METHOD in ('LWF', 'MAS', None):
+                loss = criterion(output, target).mean()
+            else:
+                loss = criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1)
             losses.append(loss.view(-1))
             corrects.append((target == output.max(-1).indices).view(-1))
         avg_loss = torch.cat(losses).mean().item()
@@ -270,12 +283,15 @@ def main():
     for t in trange(len(train_dataset_sequence)):
         train_loader = make_dataloader(train_dataset_sequence[t], True)
         train_loader_cycle = icycle(train_loader)
-        optimizer = optim.Adam([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR)
+        if FLAGS.METHOD in ('LWF', 'MAS'):
+            optimizer = optim.SGD([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR, momentum=0.9)
+        else:
+            optimizer = optim.Adam([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR)
         # lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_STEP))
         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, FLAGS.MAX_STEP)
 
         if FLAGS.METHOD == 'LWF':
-            regularizer = LWF(model, criterion)
+            regularizer = LWF(model, nn.KLDivLoss(reduction='none'))
         elif FLAGS.METHOD == 'LWF+KFAC':
             regularizer_lwf = LWF(model, criterion)
         elif FLAGS.METHOD == 'LWF+EWC':
@@ -288,34 +304,53 @@ def main():
             target = target.cuda()
             optimizer.zero_grad()
             output = model(input)
-            mse_loss = criterion(output[t], 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
+            if FLAGS.METHOD in ('LWF', 'MAS', None):
+                mse_loss = criterion(output[t], target).mean()
+            else:
+                mse_loss = criterion(output[t], 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
 
             if FLAGS.METHOD == 'LWF':
-                reg_loss = regularizer.compute_loss(input, output, t)
+                if t > 0:
+                    reg_loss = regularizer.compute_loss(input, output, t)
+                else:
+                    reg_loss = 0.
+                loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'EWC':
                 # reg_loss = regularizer.compute_loss()
                 reg_loss = sum(r.compute_loss() for r in regularizer_list) * 1.0
+                loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'KFAC':
                 if regularizer is not None:
                     reg_loss = regularizer.compute_loss(center_dict) * t
                 else:
                     reg_loss = 0.
+                loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'EKFAC':
                 if regularizer is not None:
                     reg_loss = regularizer.compute_loss(center_dict) * t
                 else:
                     reg_loss = 0.
+                loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'LWF+KFAC':
                 lwf_loss = regularizer_lwf.compute_loss(input, output, t)
                 reg_loss = sum(r.compute_loss() for r in regularizer_list)
                 reg_loss /= 2
+                loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'LWF+EWC':
                 reg_loss = regularizer_lwf.compute_loss(input, output, t) + sum(r.compute_loss() for r in regularizer_list) * 1.0
                 reg_loss /= 2
+                loss = (mse_loss + reg_loss)/(t+1)
+            elif FLAGS.METHOD == 'MAS':
+                if t>0:
+                    reg_loss = regularizer.compute_loss(center_dict) * t
+                else:
+                    reg_loss = 0.
+                loss = (mse_loss + reg_loss)/(t+1)
+            elif FLAGS.METHOD == None:
+                reg_loss = 0.
+                loss = mse_loss
             else:
                 raise NotImplementedError(FLAGS.METHOD)
-            loss = (mse_loss + reg_loss)/(t+1)
-            # loss = mse_loss
             loss.backward()
             # weight_decay(model.module.named_parameters(), FLAGS.WEIGHT_DECAY)
             weight_decay_origin(model.module, FLAGS.WEIGHT_DECAY)
@@ -336,11 +371,6 @@ def main():
 
 
         if FLAGS.METHOD == 'EWC':
-            # compute ewc state
-            # old_ewc_state = regularizer.state_dict()
-            # regularizer.compute_curvature(train_dataset_sequence[t], 10000, t)
-            # regularizer.merge_regularizer(old_ewc_state)
-
             # compute ewc state
             regularizer = EWCRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (CustomLinear, CustomConv2d, CustomBatchNorm2d))])
             regularizer.compute_curvature(train_dataset_sequence[t], 1000, t) # TODO: not fair becuase of batch sizes
@@ -397,6 +427,21 @@ def main():
             regularizer.compute_curvature(train_dataset_sequence[t], 1000, t)
             regularizer_list.append(regularizer)
 
+        elif FLAGS.METHOD == 'MAS':
+            if regularizer is None:
+                regularizer = MASRegularizer(model, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                regularizer.compute_importance(train_dataset_sequence[t], 1000, t)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+            else:
+                new_regularizer = MASRegularizer(model, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                new_regularizer.compute_importance(train_dataset_sequence[t], 1000, t)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                for module in regularizer.modules:
+                    mas_state = regularizer.mas_state_dict[module]
+                    new_mas_state = new_regularizer.mas_state_dict[module]
+                    mas_state.O_weight = (mas_state.O_weight*t + new_mas_state.O_weight) / (t+1)
+                    if mas_state.O_bias is not None:
+                        mas_state.O_bias = (mas_state.O_bias*t + new_mas_state.O_bias) / (t+1)
 
     if FLAGS.SAVE:
         save_pickle()

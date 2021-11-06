@@ -7,8 +7,8 @@ import os
 from tqdm import tqdm, trange
 import numpy as np
 import random
-from models.resnet_cifar100_jvplrelu import resnet18, resnet50
-# from models.resnet_cifar100_lrelu import resnet18, resnet50
+# from models.resnet_cifar100_jvplrelu import resnet18, resnet50
+from models.resnet_cifar100_lrelu import resnet18, resnet50
 from torch.nn.parallel import DataParallel
 from torchvision import datasets
 import atexit
@@ -19,9 +19,10 @@ from utils import MultiEpochsDataLoader
 from dataset import DataIncrementalTenfoldCIFAR100, DataIncrementalHundredfoldCIFAR100
 import shutil
 from kfac import KFACRegularizer, EWCRegularizer, EKFACRegularizer, get_center_dict
+from regularizer import MASRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
-from utils import get_log_dir
+from utils import get_log_dir, get_timestamp
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -49,7 +50,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     CHECKPOINT_DIR = '/workspace/runs/temp111'
-    LOG_DIR = '/workspace/runs/torch_rbu_cifar_96'
+    LOG_DIR = '/workspace/runs/'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-5
@@ -58,7 +59,7 @@ class FLAGS(NamedTuple):
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
-    METHOD = 'EKFAC'
+    METHOD = 'MAS'
 
 
 def tprint(obj):
@@ -79,14 +80,14 @@ def weight_decay(named_parameters, lam):
 
 def weight_decay_origin(model: nn.Module, lam: float = 1e-4):
     for module in model.modules():
-        if type(module) in (CustomLinear, CustomConv2d):
-            module.weight_tangent.grad.data.add_(module.weight.data + module.weight_tangent.data, alpha=lam)
-            # if module.bias_tangent is not None:
-            #     module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
-        elif type(module) in (nn.Linear, nn.Conv2d):
+        if type(module) in (nn.Linear, nn.Conv2d):
             module.weight.grad.data.add_(module.weight.data, alpha=lam)
             # if module.bias is not None:
             #     module.bias.grad.data.add_(module.bias.data, alpha=lam)
+        elif type(module) in (CustomLinear, CustomConv2d):
+            module.weight_tangent.grad.data.add_(module.weight.data + module.weight_tangent.data, alpha=lam)
+            # if module.bias_tangent is not None:
+            #     module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
 
 
 # maybe regularize weights only?
@@ -170,11 +171,11 @@ def get_target_transform_fn(num_classes: int = 10, alpha: float = 15.0):
 
 
 def main():
-    log_dir = get_log_dir(FLAGS.LOG_DIR)
+    log_dir = os.path.join(FLAGS.LOG_DIR, get_timestamp())
+    if FLAGS.SAVE:
+        shutil.copytree('./', log_dir, dirs_exist_ok=True)
     summary_writer = SummaryWriter(log_dir=log_dir, max_queue=1)
     print(f"{log_dir=}")
-    if FLAGS.SAVE:
-        shutil.copytree('./', FLAGS.LOG_DIR, dirs_exist_ok=True)
 
     transform_train = T.Compose([
         T.RandomCrop(32, padding=4),
@@ -197,8 +198,8 @@ def main():
     # num_classes = 10
     # target_transform = get_target_transform_fn(num_classes=num_classes, alpha=15.0)
 
-    # train_dataset_sequence = [DataIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(10)]
-    train_dataset_sequence = [DataIncrementalHundredfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(100)]
+    train_dataset_sequence = [DataIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(10)]
+    # train_dataset_sequence = [DataIncrementalHundredfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(100)]
     test_dataset = datasets.CIFAR100(FLAGS.DATA_ROOT, train=False, transform=transform_test)
     test_loader = make_dataloader(test_dataset, train=False)
 
@@ -212,7 +213,10 @@ def main():
     # initialize grad attributes to zeros
     initialize_model(model, torch.zeros((1, 3, 32, 32), device='cuda'))
 
-    criterion = CustomMSELoss(reduction='none')
+    if FLAGS.METHOD in ('LWF', 'MAS'):
+        criterion = nn.CrossEntropyLoss(reduction='none')
+    else:
+        criterion = CustomMSELoss(reduction='none')
 
     @torch.no_grad()
     def update_batchnorm():
@@ -233,7 +237,10 @@ def main():
             input = input.cuda()
             target = target.cuda()
             output = model(input)
-            loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1)
+            if FLAGS.METHOD in ('LWF', 'MAS'):
+                loss = criterion(output, target).mean()
+            else:
+                loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1)
             losses.append(loss.view(-1))
             corrects.append((target == output.max(-1).indices).view(-1))
         avg_loss = torch.cat(losses).mean().item()
@@ -244,7 +251,7 @@ def main():
 
     def save_pickle():
         pickle = model.state_dict()
-        pickle_path = os.path.join(FLAGS.LOG_DIR, f'state_dict.pt')
+        pickle_path = os.path.join(log_dir, f'state_dict.pt')
         torch.save(pickle, pickle_path)
         tprint(f'[SAVE] Saved to {pickle_path}')
 
@@ -279,7 +286,10 @@ def main():
             target = target.cuda()
             optimizer.zero_grad()
             output = model(input)
-            mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
+            if FLAGS.METHOD in ('LWF', 'MAS'):
+                mse_loss = criterion(output, target).mean()
+            else:
+                mse_loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1).mean()
 
             if FLAGS.METHOD == 'LWF':
                 reg_loss = regularizer.compute_loss(input, output)
@@ -310,6 +320,13 @@ def main():
                 reg_loss = regularizer_lwf.compute_loss(input, output, t) + sum(r.compute_loss() for r in regularizer_list) * 1.0
                 reg_loss /= 2
                 loss = (mse_loss + reg_loss)/(t+1)
+            elif FLAGS.METHOD == 'MAS':
+                if t>0:
+                    reg_loss = regularizer.compute_loss(center_dict)
+                    loss = (mse_loss + reg_loss*t)/(t+1)
+                else:
+                    reg_loss = 0.
+                    loss = mse_loss
             elif FLAGS.METHOD is None:
                 reg_loss = 0.
                 loss = mse_loss
@@ -317,8 +334,8 @@ def main():
                 raise NotImplementedError(FLAGS.METHOD)
             # loss = mse_loss
             loss.backward()
-            weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
-            # weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
+            # weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
+            weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
             optimizer.step()
             lr_scheduler.step()
 
@@ -348,16 +365,16 @@ def main():
         if FLAGS.METHOD == 'KFAC':
             # compute kfac state
             if regularizer is None:
-                regularizer = KFACRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
                 regularizer.compute_curvature(train_dataset_sequence[t], 1000, batch_size=128)
-                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                center_dict = get_center_dict([m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
             else:
-                new_regularizer = KFACRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                new_regularizer = KFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
                 new_regularizer.compute_curvature(train_dataset_sequence[t], 1000, batch_size=128)
-                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                center_dict = get_center_dict([m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
                 for old_kfac_state, new_kfac_state in zip(regularizer.kfac_state_dict.values(), new_regularizer.kfac_state_dict.values()):
-                    old_kfac_state.S = (old_kfac_state.S*t + new_kfac_state.S)/(t+1)
                     old_kfac_state.A = (old_kfac_state.A*t + new_kfac_state.A)/(t+1)
+                    old_kfac_state.S = (old_kfac_state.S*t + new_kfac_state.S)/(t+1)
 
         if FLAGS.METHOD == 'EKFAC':
             regularizer = EKFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, CustomLinear, CustomConv2d))])
@@ -374,6 +391,22 @@ def main():
             regularizer = EWCRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d, CustomLinear, CustomConv2d, CustomBatchNorm2d))])
             regularizer.compute_curvature(train_dataset_sequence[t], n_steps=1000)
             regularizer_list.append(regularizer)
+
+        elif FLAGS.METHOD == 'MAS':
+            if regularizer is None:
+                regularizer = MASRegularizer(model, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                regularizer.compute_importance(train_dataset_sequence[t], 1000)
+                center_dict = get_center_dict([m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+            else:
+                new_regularizer = MASRegularizer(model, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                new_regularizer.compute_importance(train_dataset_sequence[t], 1000)
+                center_dict = get_center_dict([m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                for module in regularizer.modules:
+                    mas_state = regularizer.mas_state_dict[module]
+                    new_mas_state = new_regularizer.mas_state_dict[module]
+                    mas_state.O_weight = (mas_state.O_weight*t + new_mas_state.O_weight) / (t+1)
+                    if mas_state.O_bias is not None:
+                        mas_state.O_bias = (mas_state.O_bias*t + new_mas_state.O_bias) / (t+1)
 
 
     if FLAGS.SAVE:

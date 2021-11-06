@@ -363,6 +363,7 @@ class StanfordCars196(datasets.VisionDataset):
 
 class TaskIncrementalTenfoldCIFAR100(datasets.VisionDataset):
     base_folder = 'cifar-100-python-tenfold_ti'
+    # base_folder = 'cifar-100-python-tenfold_ti_unshuffled'
     train_list = ['train'+str(i)+'.npz' for i in range(10)]
     test_list = ['test'+str(i)+'.npz' for i in range(10)]
 

@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.modules.utils import _single, _pair, _triple, _reverse_repeat_tuple
 from torch.nn.common_types import _size_1_t, _size_2_t, _size_3_t
+from typing import Tuple
 
 
 class CustomSequential(nn.Sequential):
@@ -33,14 +34,26 @@ class CustomLinear(nn.Linear):
         return output, jvp
 
 
+class CustomReLU(nn.ReLU):
+    def __init__(self, inplace: bool = False) -> None:
+        super().__init__(inplace=inplace)
+
+    def forward(self, input, jvp):
+        mask = input > 0.
+        output = F.relu(input, self.inplace)
+        jvp = jvp * mask
+        return output, jvp
+
+
 class CustomLeakyReLU(nn.LeakyReLU):
     def __init__(self, negative_slope: float = 1e-2, inplace: bool = False) -> None:
-        assert inplace == False
         super().__init__(negative_slope=negative_slope, inplace=inplace)
 
     def forward(self, input, jvp):
-        jvp = torch.where(input>0., torch.ones_like(input), torch.full_like(input, self.negative_slope)) * jvp
+        mask = input > 0.
         output = F.leaky_relu(input, self.negative_slope, self.inplace)
+        jvp = jvp * torch.where(mask, 1., self.negative_slope)
+        # jvp = jvp.where(mask, jvp*self.negative_slope)
         return output, jvp
 
 
@@ -154,4 +167,12 @@ class CustomAdaptiveAvgPool2d(nn.AdaptiveAvgPool2d):
     def forward(self, input, jvp):
         output = F.adaptive_avg_pool2d(input, self.output_size)
         jvp = F.adaptive_avg_pool2d(jvp, self.output_size)
+        return output, jvp
+
+
+class CustomMaxPool2d(nn.MaxPool2d):
+    def forward(self, input: torch.Tensor, jvp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        output, indices = F.max_pool2d(input, self.kernel_size, self.stride, self.padding, self.dilation, self.ceil_mode, True)
+        b, c, out_h, out_w = output.shape
+        jvp = torch.gather(jvp.view(b, c, -1), 2, indices.view(b, c, -1)).reshape(b, c, out_h, out_w)
         return output, jvp

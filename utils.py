@@ -15,10 +15,24 @@ from datetime import datetime
 import os
 
 
+def image_loader(path: str) -> Image.Image:
+    try:
+        with open(path, 'rb') as fp:
+            image = decode_jpeg(fp.read(), colorspace='RGB')
+        image = Image.fromarray(image)
+    except:
+        image = Image.open(path).convert('RGB')
+    return image
+
+
 def get_log_dir(base_path, comment=''):
     current_time = datetime.now().strftime('%b%d_%H-%M-%S')
     log_dir = os.path.join(base_path, current_time + '_' + socket.gethostname() + comment)
     return log_dir
+
+
+def get_timestamp() -> str:
+    return datetime.now().strftime('%b%d_%H-%M-%S')
 
 
 def get_logger(log_path, level=logging.INFO):

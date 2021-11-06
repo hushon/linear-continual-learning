@@ -80,9 +80,9 @@ def compute_A(module: nn.Module, a: torch.Tensor) -> torch.Tensor:
         # a = a.transpose(0,1)
         # a = a.reshape(a.size(0), -1)
         # A = torch.mm(a, a.T)
-        # A = oe.contract("bij, bkj -> ik", a, a, backend='torch') # (Cin*k*k, Cin*k*k)
         A = torch.einsum("bij, bkj -> ik", a, a) # (Cin*k*k, Cin*k*k)
         A /= bhw
+        # A /= a.size(0)
     elif isinstance(module, nn.BatchNorm2d):
         # a.shape == (B, C, h, w)
         b = a.size(0)
@@ -93,7 +93,7 @@ def compute_A(module: nn.Module, a: torch.Tensor) -> torch.Tensor:
         # A = a.view(a.size(0), -1) @ a.view(a.size(0), -1).t() # (C, B*h*w)@(B*h*w, C) = (C, C)
         if module.bias is not None:
             a = F.pad(a, (0,0,0,0,0,1,0,0), value=1) # (B, C+1, h, w)
-        A = oe.contract("bijk, bljk -> il", a, a, backend='torch') # (C, C)
+        A = torch.einsum("bijk, bljk -> il", a, a) # (C, C)
         A /= b
     else:
         raise NotImplementedError(f'{type(module)}')
@@ -127,7 +127,7 @@ def compute_S(module: nn.Module, g: torch.Tensor) -> torch.Tensor:
         # g = g.transpose(0,1) # (C, B, h, w)
         # g = g.view(g.size(0), g.size(1), -1).contiguous() # (C, B, h*w)
         # S = g.view(g.size(0),-1) @ g.view(g.size(0),-1).t() # (C, B*h*w) @ (C, B*h*w) = (C, C)
-        S = oe.contract("bijk, bljk -> il", g, g, backend='torch')
+        S = torch.einsum("bijk, bljk -> il", g, g)
         S /= bhw
     else:
         raise NotImplementedError(f'{type(module)}')
@@ -419,7 +419,7 @@ class EWCRegularizer:
         self._init_ewc_states()
 
     def _init_ewc_states(self):
-        for module in self.modules():
+        for module in self.modules:
             if type(module) in (nn.Linear, nn.Conv2d, nn.BatchNorm2d):
                 weight = module.weight
                 bias = module.bias
@@ -443,6 +443,20 @@ class EWCRegularizer:
             handle.remove()
         hook_handles.clear()
 
+    def _forward_hook(self, module: nn.Module, input: Tuple[torch.Tensor, ...], output: Tuple[torch.Tensor, ...]) -> None:
+        if type(module) in (nn.Linear, nn.Conv2d, nn.BatchNorm2d):
+            input, = input
+            output = output
+        elif type(module) in (CustomLinear, CustomConv2d, CustomBatchNorm2d):
+            input, _ = input # primal input
+            _, output = output # tangent output (=jvp)
+        else:
+            raise NotImplementedError
+        self.a_dict[module] = input.detach().clone()
+        def _tensor_backward_hook(grad: torch.Tensor) -> None:
+            self.g_dict[module] = grad.detach().clone()
+        output.requires_grad_(True).register_hook(_tensor_backward_hook)
+
     def _del_temp_states(self) -> None:
         del self.a_dict
         del self.g_dict
@@ -452,37 +466,39 @@ class EWCRegularizer:
         for module in self.modules:
             a = self.a_dict[module]
             g = self.g_dict[module]
-            if type(module) in (nn.Linear, CustomLinear):
+            if isinstance(module, nn.Linear):
                 # a.shape = (B, Nin)
                 # g.shape = (B, Nout)
                 grad_weight = torch.einsum("bi, bj -> bij", g, a)
-                grad_bias = g
-            elif type(module) in (nn.Conv2d, CustomConv2d):
+                grad_bias = g if module.bias is not None else None
+            elif isinstance(module, nn.Conv2d):
                 # a.shape = (B, Cin, h, w)
                 # g.shape = (B, Cout, h, w)
                 a = F.unfold(a, module.kernel_size, module.dilation, module.padding, module.stride) # (B, Cin*k*k, h*w)
                 g = g.reshape(g.size(0), g.size(1), -1) # (B, Cout, h*w)
-                grad_weight = torch.einsum("bij, bkj -> bik", g, a)
-                grad_bias = g.sum(2)
-            elif type(module) in (nn.BatchNorm2d, CustomBatchNorm2d):
+                grad_weight = torch.einsum("bij, bkj -> bik", g, a).reshape(a.size(0), module.out_channels, module.in_channels, *module.kernel_size)
+                grad_bias = g.sum(2) if module.bias is not None else None
+            elif isinstance(module, nn.BatchNorm2d):
                 # a.shape = (B, C, h, w)
                 # g.shape = (B, C, h, w)
                 a = (a - module.running_mean[None, :, None, None]).div(torch.sqrt(module.running_var[None, :, None, None] + module.eps))
                 grad_weight = torch.einsum("bchw, bchw -> bc", a, g)
-                grad_bias = torch.einsum("bchw -> bc", g)
+                grad_bias = torch.einsum("bchw -> bc", g) if module.bias is not None else None
             else:
                 raise NotImplementedError
 
             ewc_state = self.ewc_state_dict[module]
             ewc_state.G_weight.add_(grad_weight.square().mean(0))
-            ewc_state.G_bias.add_(grad_bias.square().mean(0))
+            if ewc_state.G_bias is not None:
+                ewc_state.G_bias.add_(grad_bias.square().mean(0))
 
-        self.n_steps += 1
+        self.n_iter += 1
 
     def _divide_curvature(self):
         for ewc_state in self.ewc_state_dict.values():
             ewc_state.G_weight.div_(self.n_iter)
-            ewc_state.G_bias.div_(self.n_iter)
+            if ewc_state.G_bias is not None:
+                ewc_state.G_bias.div_(self.n_iter)
 
     def compute_curvature(self, dataset: Dataset, n_steps: int, t: int = None, pseudo_target_fn = torch.normal) -> None:
         data_loader = MultiEpochsDataLoader(

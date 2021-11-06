@@ -18,9 +18,10 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from utils import MultiEpochsDataLoader
 from dataset import DataIncrementalTenfoldCIFAR100, DataIncrementalHundredfoldCIFAR100
 import shutil
-from kfac import KFACRegularizer, EWCRegularizer
+from kfac import KFACRegularizer, EWCRegularizer, EKFACRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
+from utils import get_timestamp
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -58,10 +59,6 @@ class FLAGS(NamedTuple):
     BN_UPDATE_STEPS = 1000
     SAVE = False
     METHOD = 'KFAC'
-
-
-if FLAGS.SAVE:
-    shutil.copytree('./', FLAGS.LOG_DIR, dirs_exist_ok=False)
 
 
 def tprint(obj):
@@ -173,6 +170,9 @@ def get_target_transform_fn(num_classes: int = 10, alpha: float = 15.0):
 
 
 def main():
+    log_dir = os.path.join(FLAGS.LOG_DIR, get_timestamp())
+    summary_writer = SummaryWriter(log_dir=log_dir, max_queue=1)
+    print(f"{log_dir=}")
 
     transform_train = T.Compose([
         T.RandomCrop(32, padding=4),
@@ -242,12 +242,11 @@ def main():
 
     def save_pickle(filename='state_dict.pt'):
         pickle = model.state_dict()
-        pickle_path = os.path.join(FLAGS.LOG_DIR, filename)
+        pickle_path = os.path.join(log_dir, filename)
         torch.save(pickle, pickle_path)
         tprint(f'[SAVE] Saved to {pickle_path}')
 
 
-    summary_writer = SummaryWriter(log_dir=FLAGS.LOG_DIR, max_queue=1)
     global_step = 0
 
     update_batchnorm()

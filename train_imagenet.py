@@ -17,6 +17,10 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from utils import MultiEpochsDataLoader, icycle
+import tqdm
+from torch.cuda import amp
+
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -128,15 +132,10 @@ def main_worker(gpu, ngpus_per_node, args):
             args.rank = args.rank * ngpus_per_node + gpu
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
-    # create model
-    # if args.pretrained:
-    #     print("=> using pre-trained model '{}'".format(args.arch))
-    #     model = models.__dict__[args.arch](pretrained=True)
-    # else:
-    #     print("=> creating model '{}'".format(args.arch))
-    #     model = models.__dict__[args.arch]()
+
     import models.resnet_imagenet_lrelu
-    model = models.resnet_imagenet_lrelu.resnet18(False, num_classes=1000)
+    # model = models.resnet_imagenet_lrelu.resnet18(False, num_classes=1000)
+    model = models.resnet_imagenet_lrelu.resnet50(False, num_classes=1000)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
@@ -262,7 +261,9 @@ def main_worker(gpu, ngpus_per_node, args):
             #     'best_acc1': best_acc1,
             #     'optimizer' : optimizer.state_dict(),
             # }, is_best)
-            save_checkpoint(model.state_dict(), is_best)
+            save_checkpoint(model.module.state_dict(), is_best)
+
+grad_scaler = amp.GradScaler()
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -290,7 +291,8 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
             target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output = model(images)
+        with amp.autocast():
+            output = model(images)
         loss = criterion(output, target)
 
         # measure accuracy and record loss
@@ -301,8 +303,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        grad_scaler.scale(loss).backward()
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
