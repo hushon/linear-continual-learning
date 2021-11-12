@@ -22,7 +22,7 @@ from kfac import KFACRegularizer, EWCRegularizer, EKFACRegularizer, get_center_d
 from regularizer import MASRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
-from utils import get_log_dir, get_timestamp
+from utils import get_timestamp
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -59,7 +59,7 @@ class FLAGS(NamedTuple):
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
-    METHOD = 'MAS'
+    METHOD = 'KFAC'
 
 
 def tprint(obj):

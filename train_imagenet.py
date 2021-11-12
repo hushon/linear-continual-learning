@@ -36,7 +36,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                         ' (default: resnet18)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=1, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -45,7 +45,7 @@ parser.add_argument('-b', '--batch-size', default=256, type=int,
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
                          'using Data Parallel or Distributed Data Parallel')
-parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+parser.add_argument('--lr', '--learning-rate', default=1e-4, type=float,
                     metavar='LR', help='initial learning rate', dest='lr')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                     help='momentum')
@@ -134,8 +134,12 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
 
     import models.resnet_imagenet_lrelu
-    # model = models.resnet_imagenet_lrelu.resnet18(False, num_classes=1000)
-    model = models.resnet_imagenet_lrelu.resnet50(False, num_classes=1000)
+    import torchvision.models
+    state_dict = torchvision.models.resnet18(pretrained=True).state_dict()
+
+    model = models.resnet_imagenet_lrelu.resnet18(False, num_classes=1000)
+    # model = models.resnet_imagenet_lrelu.resnet50(False, num_classes=1000)
+    model.load_state_dict(state_dict)
 
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')

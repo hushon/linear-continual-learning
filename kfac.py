@@ -81,8 +81,8 @@ def compute_A(module: nn.Module, a: torch.Tensor) -> torch.Tensor:
         # a = a.reshape(a.size(0), -1)
         # A = torch.mm(a, a.T)
         A = torch.einsum("bij, bkj -> ik", a, a) # (Cin*k*k, Cin*k*k)
-        A /= bhw
-        # A /= a.size(0)
+        # A /= bhw
+        A /= a.size(0)
     elif isinstance(module, nn.BatchNorm2d):
         # a.shape == (B, C, h, w)
         b = a.size(0)
@@ -426,9 +426,11 @@ class EWCRegularizer:
             elif type(module) in (CustomLinear, CustomConv2d, CustomBatchNorm2d):
                 weight = module.weight_tangent
                 bias = module.bias_tangent
+            else:
+                raise NotImplementedError
             self.ewc_state_dict[module] = EWCState(
                 G_weight=torch.zeros_like(weight),
-                G_bias=None if bias is None else torch.zeros_like(bias)
+                G_bias=torch.zeros_like(bias) if bias is not None else None
             )
 
     def _register_hooks(self) -> List[RemovableHandle]:
@@ -529,7 +531,7 @@ class EWCRegularizer:
         self._del_temp_states()
 
     def compute_loss(self, center_dict: Mapping[nn.Module, CenterState]) -> torch.Tensor:
-        losses = []
+        loss = 0.
         for module in self.modules:
             ewc_state = self.ewc_state_dict[module]
             center_state = center_dict[module]
@@ -541,10 +543,10 @@ class EWCRegularizer:
                 bias = module.bias_tangent
             else:
                 raise NotImplementedError
-            loss = torch.sum(ewc_state.G_weight * torch.square(weight - center_state.weight))
+            loss += torch.sum(ewc_state.G_weight * torch.square(weight - center_state.weight))
             if bias is not None:
                 loss += torch.sum(ewc_state.G_bias * torch.square(bias - center_state.bias))
-        return 0.5 * sum(losses)
+        return 0.5 * loss
 
 
 class EKFACRegularizer:

@@ -7,7 +7,7 @@ from typing import Tuple
 
 
 class CustomSequential(nn.Sequential):
-    def forward(self, input, jvp):
+    def forward(self, input: torch.Tensor, jvp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         for module in self:
             input, jvp = module(input, jvp)
         return input, jvp
@@ -28,10 +28,30 @@ class CustomLinear(nn.Linear):
         else:
             self.bias_tangent = nn.Parameter(torch.zeros_like(self.bias))
 
-    def forward(self, input, jvp):
+    def forward(self, input: torch.Tensor, jvp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         output = F.linear(input, self.weight, self.bias)
         jvp = F.linear(input, self.weight_tangent, self.bias_tangent) + F.linear(jvp, self.weight, None)
         return output, jvp
+
+
+class CustomLeakyReLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, jvp: torch.Tensor, negative_slope: float = 1e-2, inplace : bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        mask = x > 0.
+        ctx.save_for_backward(negative_slope, mask)
+        if inplace:
+            x[~mask] *= negative_slope
+            jvp[~mask] *= negative_slope
+        else:
+            pass
+        return x, jvp
+
+    @staticmethod
+    def backward(ctx, grad_x: torch.Tensor, grad_jvp: torch.Tensor):
+        negative_slope, mask = ctx.saved_tensors
+
+        return grad_x, grad_jvp
+
 
 
 class CustomReLU(nn.ReLU):
@@ -85,7 +105,7 @@ class CustomConv2d(nn.Conv2d):
         else:
             self.bias_tangent = nn.Parameter(torch.zeros_like(self.bias))
 
-    def forward(self, input, jvp):
+    def forward(self, input: torch.Tensor, jvp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         output = self._conv_forward(input, self.weight, self.bias)
         jvp = self._conv_forward(input, self.weight_tangent, self.bias_tangent) + self._conv_forward(jvp, self.weight, None)
         return output, jvp
@@ -104,7 +124,7 @@ class CustomBatchNorm2d(nn.BatchNorm2d):
         self.weight_tangent = nn.Parameter(torch.zeros_like(self.weight))
         self.bias_tangent = nn.Parameter(torch.zeros_like(self.bias))
 
-    def forward(self, input, jvp):
+    def forward(self, input: torch.Tensor, jvp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # assert not self.training
         self._check_input_dim(input)
 
@@ -164,7 +184,7 @@ class CustomBatchNorm2d(nn.BatchNorm2d):
 
 
 class CustomAdaptiveAvgPool2d(nn.AdaptiveAvgPool2d):
-    def forward(self, input, jvp):
+    def forward(self, input: torch.Tensor, jvp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         output = F.adaptive_avg_pool2d(input, self.output_size)
         jvp = F.adaptive_avg_pool2d(jvp, self.output_size)
         return output, jvp
@@ -176,3 +196,17 @@ class CustomMaxPool2d(nn.MaxPool2d):
         b, c, out_h, out_w = output.shape
         jvp = torch.gather(jvp.view(b, c, -1), 2, indices.view(b, c, -1)).reshape(b, c, out_h, out_w)
         return output, jvp
+
+from .bilinear_layers import matrix_sqrt, sign_sqrt
+class BilinearPool2d(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.matrix_sqrt = matrix_sqrt.apply
+        self.sign_sqrt = sign_sqrt.apply
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.matrix_sqrt(x)
+        x = self.sign_sqrt(x)
+        x = x.reshape(x.size(0), -1)
+        x = F.normalize(x)
+        return x

@@ -10,7 +10,79 @@ from utils import icycle, MultiEpochsDataLoader
 from dataclasses import dataclass
 from collections import OrderedDict
 from torch import optim
-import opt_einsum as oe
+
+
+def compute_A(module: nn.Module, a: torch.Tensor) -> torch.Tensor:
+    if isinstance(module, nn.Linear):
+        # a.shape == (B, Nin)
+        b = a.size(0)
+        if module.bias is not None: #TODO
+            a = F.pad(a, (0,1), value=1) # (B, Nin+1)
+        A = torch.einsum("bi, bj -> ij", a, a)
+        A /= b
+    elif isinstance(module, nn.Conv2d):
+        # a.shape == (B, Cin, h, w)
+        a = F.unfold(a, module.kernel_size, module.dilation, module.padding, module.stride) # (B, Cin*k*k, h*w)
+        bhw = a.size(0)*a.size(2)
+        if module.bias is not None:
+            a = F.pad(a, (0,0,0,1,0,0), value=1) # (B, Cin*k*k+1, h*w)
+        A = torch.einsum("bij, bkj -> ik", a, a) # (Cin*k*k, Cin*k*k)
+        A /= bhw
+    else:
+        raise NotImplementedError(f'{type(module)}')
+    return A
+
+
+def compute_S(module: nn.Module, g: torch.Tensor) -> torch.Tensor:
+    if isinstance(module, nn.Linear):
+        # g.shape == (B, Nout)
+        b = g.size(0)
+        S = torch.einsum("bi, bj -> ij", g, g)
+        S /= b
+    elif isinstance(module, nn.Conv2d):
+        # g.shape == (B, Cout, h, w)
+        b = g.size(0)
+        S = torch.einsum("bijk, bljk -> il", g, g)
+        S /= b
+    else:
+        raise NotImplementedError(f'{type(module)}')
+    return S
+
+
+class EKFAC(torch.optim.Optimizer):
+
+    def __init__(self, modules, eps, sua=False, ra=False, update_freq=1, alpha=.75):
+        self.eps = eps
+        self.sua = sua
+        self.ra = ra
+        self.update_freq = update_freq
+        self.alpha = alpha
+        self.params = []
+        self._fwd_handles = []
+        self._bwd_handles = []
+        self._iteration_counter = 0
+        if not self.ra and self.alpha != 1.:
+            raise NotImplementedError
+        assert all(isinstance(m, (nn.Linear, nn.Conv2d)) for m in modules)
+        for mod in modules:
+            mod_class = mod.__class__.__name__
+            # handle = mod.register_forward_pre_hook(self._save_input)
+            handle = mod.register_forward_hook(self._forward_hook)
+            self._fwd_handles.append(handle)
+            # handle = mod.register_backward_hook(self._save_grad_output)
+            # self._bwd_handles.append(handle)
+            self.params.append({
+                'params': list(mod.parameters()),
+                'mod': mod,
+                'layer_type': mod_class,
+                'SUA': self.sua if isinstance(mod, nn.Conv2d) else False,
+            })
+            defaults = {
+                'SUA': False,
+                'lr': 1e-1,
+            }
+        super(EKFAC, self).__init__(self.params, defaults)
+
 
 
 class EKFACOptimizer(optim.Optimizer):

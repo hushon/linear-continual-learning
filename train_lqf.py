@@ -8,10 +8,6 @@ import os
 from tqdm import tqdm, trange
 import numpy as np
 import random
-# from models.resnet_cifar100_jvplrelu import resnet18, resnet50
-# from models.resnet_cifar100_lrelu import resnet18, resnet50
-from models.resnet_imagenet_lrelu import resnet18
-# from models.resnet_imagenet_jvplrelu import resnet18
 from torch.nn.parallel import DataParallel
 from torchvision import datasets
 import atexit
@@ -51,17 +47,19 @@ class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     # CHECKPOINT_PATH = '/workspace/runs/temp111/state_dict.pt'
     # CHECKPOINT_PATH = '/workspace/runs/torch_imagenet32_resnet50_new/state_dict.pt'
-    CHECKPOINT_PATH = '/workspace/runs/imagenet_resnet18_lrelu/model_best.pt'
+    # CHECKPOINT_PATH = '/workspace/runs/imagenet_resnet18_lrelu/model_best.pt'
+    CHECKPOINT_PATH = './checkpoint/imagenet_resnet18_lrelu_lr0.001/model_best.pt'
     LOG_DIR = '/workspace/runs/'
     BATCH_SIZE = 128
     INIT_LR = 1E-4
     WEIGHT_DECAY = 1E-5
     MAX_STEP = 8000
-    N_WORKERS = 6
+    N_WORKERS = 16
     BN_UPDATE_STEPS = 1000
     SAVE = True
-    LOSS_FN = 'SCE'
+    LOSS_FN = 'MSE'
     OPTIM = 'ADAM'
+    GAF = True
 
 
 
@@ -138,38 +136,107 @@ def get_cifar100():
 
 def get_mit67():
     transform_train = T.Compose([
-        T.RandomResizedCrop(224),
-        T.RandomHorizontalFlip(),
+        # T.RandomResizedCrop(224),
+        # T.RandomHorizontalFlip(),
+        T.Resize((256,256)),
+        T.RandomCrop((224,224)),
+        # T.CenterCrop((224,224)),
         T.ToTensor(),
         T.Normalize(dataset.MIT67.MEAN, dataset.MIT67.STD)
         ])
     transform_test = T.Compose([
-        T.Resize(256),
-        T.CenterCrop(224),
+        T.Resize((256,256)),
+        T.CenterCrop((224,224)),
         T.ToTensor(),
         T.Normalize(dataset.MIT67.MEAN, dataset.MIT67.STD)
         ])
-    train_dataset = dataset.MIT67(FLAGS.DATA_ROOT, transform_train, train=True)
-    test_dataset = dataset.MIT67(FLAGS.DATA_ROOT, transform_test, train=False)
+    train_dataset = dataset.MIT67(os.path.join(FLAGS.DATA_ROOT, 'MIT67'), transform_train, train=True, loader=image_loader)
+    test_dataset = dataset.MIT67(os.path.join(FLAGS.DATA_ROOT, 'MIT67'), transform_test, train=False, loader=image_loader)
     return train_dataset, test_dataset, 67
 
 
 def get_caltech256():
+    # transform_train = T.Compose([
+    #     T.Resize((224,224)),
+    #     T.RandomHorizontalFlip(),
+    #     T.ToTensor(),
+    #     T.Normalize(dataset.Caltech256.MEAN, dataset.Caltech256.STD)
+    #     ]   )
+    # transform_test = T.Compose([
+    #     T.Resize((224,224)),
+    #     T.ToTensor(),
+    #     T.Normalize(dataset.Caltech256.MEAN, dataset.Caltech256.STD)
+    #     ])
+    # transform_train = T.Compose([
+    #     T.Resize((224,224)),
+    #     # T.RandomCrop(224, pad_if_needed=True),
+    #     # T.Resize(224),
+    #     # T.CenterCrop(224),
+    #     T.RandomHorizontalFlip(),
+    #     # T.RandomAffine(15, (0.3, 0.3), (0.7, 1.3)),
+    #     T.ToTensor(),
+    #     T.Normalize(dataset.Caltech256.MEAN, dataset.Caltech256.STD)
+    #     ]   )
+    # transform_test = T.Compose([
+    #     T.Resize((224,224)),
+    #     # T.CenterCrop(224),
+    #     T.ToTensor(),
+    #     T.Normalize(dataset.Caltech256.MEAN, dataset.Caltech256.STD)
+    #     ])
+    from PIL import ImageEnhance
+    enhancers = {
+        0: lambda image, f: ImageEnhance.Color(image).enhance(f),
+        1: lambda image, f: ImageEnhance.Contrast(image).enhance(f),
+        2: lambda image, f: ImageEnhance.Brightness(image).enhance(f),
+        3: lambda image, f: ImageEnhance.Sharpness(image).enhance(f)
+    }
+
+    factors = {
+        0: lambda: np.random.normal(1.0, 0.3),
+        1: lambda: np.random.normal(1.0, 0.1),
+        2: lambda: np.random.normal(1.0, 0.1),
+        3: lambda: np.random.normal(1.0, 0.3),
+    }
+    
+    # random enhancers in random order
+    def enhance(image):
+        order = [0, 1, 2, 3]
+        np.random.shuffle(order)
+        for i in order:
+            f = factors[i]()
+            image = enhancers[i](image, f)
+        return image
+    
+    # train data augmentation on the fly
+    # transform_train = T.Compose([
+    #     T.Scale(384, Image.LANCZOS),
+    #     T.RandomCrop(299),
+    #     T.RandomHorizontalFlip(),
+    #     T.Lambda(enhance),
+    #     T.ToTensor(),
+    #     T.Normalize(dataset.Caltech256.MEAN, dataset.Caltech256.STD)
+    # ])
+    
+    # # validation data is already resized
+    # transform_test = T.Compose([
+    #     T.Scale(299, Image.LANCZOS),
+    #     T.CenterCrop(299),
+    #     T.ToTensor(),
+    #     T.Normalize(dataset.Caltech256.MEAN, dataset.Caltech256.STD)
+    # ])
     transform_train = T.Compose([
-        T.Resize((224,224)),
-        # T.RandomCrop(224, pad_if_needed=True),
-        # T.CenterCrop(224),
-        T.RandomHorizontalFlip(),
-        # T.RandomAffine(15, (0.3, 0.3), (0.7, 1.3)),
+        T.Resize((256,256)),
+        T.RandomCrop((224,224)),
         T.ToTensor(),
         T.Normalize(dataset.Caltech256.MEAN, dataset.Caltech256.STD)
         ])
     transform_test = T.Compose([
-        T.Resize((224,224)),
-        # T.CenterCrop(224),
+        T.Resize((256,256)),
+        T.CenterCrop((224,224)),
         T.ToTensor(),
         T.Normalize(dataset.Caltech256.MEAN, dataset.Caltech256.STD)
         ])
+
     train_dataset = dataset.Caltech256(FLAGS.DATA_ROOT, transform_train, train=True, loader=image_loader)
     test_dataset = dataset.Caltech256(FLAGS.DATA_ROOT, transform_test, train=False, loader=image_loader)
     return train_dataset, test_dataset, 256
@@ -183,7 +250,9 @@ def main():
     print(f"{log_dir=}")
 
     # train_dataset, test_dataset, n_classes = get_cifar100()
-    train_dataset, test_dataset, n_classes = get_caltech256()
+    # train_dataset, test_dataset, n_classes = get_caltech256()
+    train_dataset, test_dataset, n_classes = get_mit67()
+
     transform_target = get_target_transform_fn(n_classes, 15.)
 
     train_loader = MultiEpochsDataLoader(train_dataset,
@@ -197,10 +266,24 @@ def main():
             num_workers=FLAGS.N_WORKERS
             )
 
+    # from models.resnet_cifar100_jvplrelu import resnet18, resnet50
+    # from models.resnet_cifar100_lrelu import resnet18, resnet50
+    # from models.resnet_imagenet_lrelu import resnet18
+    from models.resnet_imagenet_jvplrelu import resnet18
+
     model = resnet18(num_classes=n_classes).cuda()
-    # model = resnet50(num_classes=n_classes).cuda()
+    # # # model = resnet50(num_classes=n_classes).cuda()
     state_dict = torch.load(FLAGS.CHECKPOINT_PATH)
+    state_dict.pop('fc.weight')
+    state_dict.pop('fc.bias')
     model.load_state_dict(state_dict, strict=False)
+
+    import torchvision
+    # model = torchvision.models.resnet18(pretrained=True)
+    # model.fc = nn.Linear(512, n_classes)
+    # model = torchvision.models.resnet50(pretrained=True)
+    # model.fc = nn.Linear(2048, n_classes)
+    # model.cuda()
 
     # freeze feature extractor
     # for name, param in model.named_parameters():
@@ -282,8 +365,11 @@ def main():
     train_loader = icycle(train_loader)
     global_step = 0
 
-    # model.train()
-    model.eval()
+    if FLAGS.GAF:
+        model.eval()
+    else:
+        model.train()
+
     for i in (pbar := trange(FLAGS.MAX_STEP)):
         optimizer.zero_grad()
         input, target = next(train_loader)
@@ -295,8 +381,8 @@ def main():
         elif FLAGS.LOSS_FN == 'SCE':
             loss = criterion(output, target).mean()
         loss.backward(create_graph=isinstance(optimizer, torch_optimizer.Adahessian))
-        # weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
-        weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
+        weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
+        # weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
         optimizer.step()
         lr_scheduler.step()
         global_step += 1
@@ -309,7 +395,8 @@ def main():
 
         if i%200 == 0:
             evaluate()
-            # model.train()
+            if not FLAGS.GAF:
+                model.train()
 
 
     if FLAGS.SAVE:
