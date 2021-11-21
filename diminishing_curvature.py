@@ -15,6 +15,7 @@ from PIL import Image
 from utils import MultiEpochsDataLoader
 import torch_optimizer
 from models.modules import CustomLinear, CustomConv2d, CustomBatchNorm2d
+from kfac import EKFACRegularizer
 from torch.utils.tensorboard import SummaryWriter
 import dataset
 from utils import get_timestamp, image_loader
@@ -45,24 +46,23 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
-    # CHECKPOINT_PATH = '/workspace/runs/temp111/state_dict.pt' # CIFAR ResNet18, ImageNet32 pretrained
-    # CHECKPOINT_PATH = '/workspace/runs/torch_imagenet32_resnet50_new/state_dict.pt' # CIFAR ResNet50, ImageNet32 pretrained
-    CHECKPOINT_PATH = '/workspace/runs/pretrain_tinyimagenet_resnet18/state_dict.pt' # CIFAR ResNet18, TinyImageNet pretrained
-    # CHECKPOINT_PATH = '/workspace/runs/imagenet_resnet18_lrelu/model_best.pt' # ImageNet ResNet18, ImageNet pretrained
-    # CHECKPOINT_PATH = './checkpoint/imagenet_resnet18_lrelu_lr0.001/model_best.pt' # ImageNet ResNet18, ImageNet pretrained
+    CHECKPOINT_PATH = '/workspace/runs/temp111/state_dict.pt'
+    # CHECKPOINT_PATH = '/workspace/runs/torch_imagenet32_resnet50_new/state_dict.pt'
+    # CHECKPOINT_PATH = '/workspace/runs/imagenet_resnet18_lrelu/model_best.pt'
+    # CHECKPOINT_PATH = './checkpoint/imagenet_resnet18_lrelu_lr0.001/model_best.pt'
     LOG_DIR = '/workspace/runs/'
     BATCH_SIZE = 128
-    # INIT_LR = 1E-4
-    INIT_LR = 1E-2
+    INIT_LR = 1E-4
+    # INIT_LR = 1E-2
     WEIGHT_DECAY = 1E-5
-    MAX_STEP = 8000
-    N_WORKERS = 4
+    MAX_STEP = 16000
+    N_WORKERS = 16
     BN_UPDATE_STEPS = 1000
     SAVE = True
-    LOSS_FN = 'SCE'
-    OPTIM = 'SGD'
-    GAF = False
-    TRACK_BN = True
+    LOSS_FN = 'MSE'
+    OPTIM = 'ADAM'
+    LINEARIZED = False
+    TRACK_BN = False
 
 
 
@@ -246,8 +246,7 @@ def get_caltech256():
 
 
 def main():
-    timestamp = get_timestamp()
-    log_dir = os.path.join(FLAGS.LOG_DIR, timestamp)
+    log_dir = os.path.join(FLAGS.LOG_DIR, get_timestamp())
     # if FLAGS.SAVE:
     #     shutil.copytree('./', log_dir, dirs_exist_ok=True)
     summary_writer = SummaryWriter(log_dir=log_dir, max_queue=1)
@@ -270,16 +269,13 @@ def main():
             num_workers=FLAGS.N_WORKERS
             )
 
-
-    if FLAGS.GAF:
-        from models.resnet_cifar100_jvplrelu import resnet18, resnet50
-        # from models.resnet_imagenet_jvplrelu import resnet18
-    else:
-        from models.resnet_cifar100_lrelu import resnet18, resnet50
-        # from models.resnet_imagenet_lrelu import resnet18
+    # from models.resnet_cifar100_jvplrelu import resnet18, resnet50
+    from models.resnet_cifar100_lrelu import resnet18, resnet50
+    # from models.resnet_imagenet_lrelu import resnet18
+    # from models.resnet_imagenet_jvplrelu import resnet18
 
     model = resnet18(num_classes=n_classes).cuda()
-    # model = resnet50(num_classes=n_classes).cuda()
+    # # # model = resnet50(num_classes=n_classes).cuda()
     state_dict = torch.load(FLAGS.CHECKPOINT_PATH)
     # state_dict.pop('fc.weight')
     # state_dict.pop('fc.bias')
@@ -297,31 +293,15 @@ def main():
     #     if 'fc' not in name:
     #         param.requires_grad_(False)
 
-    if FLAGS.LOSS_FN == 'MSE':
-        criterion = CustomMSELoss(reduction='none')
-    elif FLAGS.LOSS_FN == 'SCE':
-        criterion = nn.CrossEntropyLoss(reduction='none')
-    else:
-        raise NotImplementedError
-
-    # if FLAGS.OPTIM == 'SGD':
-    #     optimizer = optim.SGD([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR, momentum=0.9)
-    # elif FLAGS.OPTIM == 'ADAM':
-    #     optimizer = optim.Adam([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR)
-    # elif FLAGS.OPTIM == 'ADAHESSIAN':
-    #     optimizer = torch_optimizer.Adahessian([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR)
-    # else:
-    #     raise NotImplementedError
 
     if FLAGS.OPTIM == 'SGD':
-        optimizer = optim.SGD(model.parameters(), lr=FLAGS.INIT_LR, momentum=0.9)
+        optimizer = optim.SGD([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR, momentum=0.9)
     elif FLAGS.OPTIM == 'ADAM':
-        optimizer = optim.Adam(model.parameters(), lr=FLAGS.INIT_LR)
+        optimizer = optim.Adam([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR)
     elif FLAGS.OPTIM == 'ADAHESSIAN':
-        optimizer = torch_optimizer.Adahessian(model.parameters(), lr=FLAGS.INIT_LR)
+        optimizer = torch_optimizer.Adahessian([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR)
     else:
         raise NotImplementedError
-
 
     # lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_STEP))
     # lr_scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[1000, 1500], gamma=0.1)
@@ -348,10 +328,10 @@ def main():
             input = input.cuda()
             target = target.cuda()
             output = model(input)
-            if FLAGS.LOSS_FN == 'MSE':
-                loss = criterion(output, transform_target(target)).sum(1).mean()
-            elif FLAGS.LOSS_FN == 'SCE':
-                loss = criterion(output, target).mean()
+            if FLAGS.LOSS_FN == 'SCE':
+                loss = F.cross_entropy(output, target, reduction='none')
+            elif FLAGS.LOSS_FN == 'MSE':
+                loss = 0.5*F.mse_loss(output, 15.*F.one_hot(target, num_classes=n_classes).float(), reduction='none').sum(1)
             losses.append(loss.view(-1))
             corrects.append((target == output.max(-1).indices).view(-1))
             corrects_t5.append(correct(output, target, 5))
@@ -384,16 +364,31 @@ def main():
 
     model.train(FLAGS.TRACK_BN)
 
-    for i in (pbar := trange(FLAGS.MAX_STEP, desc=f'{timestamp}')):
+    for i in (pbar := trange(FLAGS.MAX_STEP)):
+
+        if i == 0:
+            if FLAGS.LOSS_FN == 'SCE':
+                criterion = lambda logit, target: F.cross_entropy(logit, target, reduction='none')
+                pseudo_target_fn = lambda logit: torch.distributions.Categorical(logit.softmax(1)).sample()
+            elif FLAGS.LOSS_FN == 'MSE':
+                criterion = lambda logit, target: 0.5*F.mse_loss(logit, target, reduction='none').sum(1)
+                pseudo_target_fn = torch.normal
+            regularizer = EKFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+            regularizer.compute_curvature(train_dataset, 1000, pseudo_target_fn=pseudo_target_fn)
+            eig = torch.cat([state.scale.cpu().view(-1) for state in regularizer.ekfac_state_dict.values()])
+            torch.save(eig, f'./figs/eig_mse2/eig_{i}.pt')
+            summary_writer.add_histogram(f"eigenspectrum", eig, global_step=global_step)
+
+
         optimizer.zero_grad()
         input, target = next(train_loader)
         input = input.cuda()
         target = target.cuda()
         output = model(input)
-        if FLAGS.LOSS_FN == 'MSE':
-            loss = criterion(output, transform_target(target)).sum(1).mean()
-        elif FLAGS.LOSS_FN == 'SCE':
-            loss = criterion(output, target).mean()
+        if FLAGS.LOSS_FN == 'SCE':
+            loss = F.cross_entropy(output, target, reduction='none').mean(0)
+        elif FLAGS.LOSS_FN == 'MSE':
+            loss = 0.5*F.mse_loss(output, 15.*F.one_hot(target, num_classes=n_classes).float(), reduction='none').sum(1).mean(0)
         loss.backward(create_graph=isinstance(optimizer, torch_optimizer.Adahessian))
         weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
         # weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
@@ -401,15 +396,28 @@ def main():
         lr_scheduler.step()
         global_step += 1
 
-        if i%100 == 0:
-            tprint(f'LR {lr_scheduler.get_last_lr()[-1]:.2e} | {loss=:.3f}')
+        if (i+1)%100 == 0:
+            pbar.set_description(f'LR {lr_scheduler.get_last_lr()[-1]:.2e} | {loss=:.3f}')
             summary_writer.add_scalar('loss/train', loss, global_step=global_step)
             summary_writer.add_scalar('lr', lr_scheduler.get_last_lr()[-1], global_step=global_step)
             # add_summary_histograms(model)
 
-        if i%200 == 0:
+        if (i+1)%200 == 0:
             evaluate()
             model.train(FLAGS.TRACK_BN)
+
+        if (i+1)%500 == 0:
+            if FLAGS.LOSS_FN == 'SCE':
+                criterion = lambda logit, target: F.cross_entropy(logit, target, reduction='none')
+                pseudo_target_fn = lambda logit: torch.distributions.Categorical(logit.softmax(1)).sample()
+            elif FLAGS.LOSS_FN == 'MSE':
+                criterion = lambda logit, target: 0.5*F.mse_loss(logit, target, reduction='none').sum(1)
+                pseudo_target_fn = torch.normal
+            regularizer = EKFACRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+            regularizer.compute_curvature(train_dataset, 1000, pseudo_target_fn=pseudo_target_fn)
+            eig = torch.cat([state.scale.cpu().view(-1) for state in regularizer.ekfac_state_dict.values()])
+            torch.save(eig, f'./figs/eig_mse2/eig_{i}.pt')
+            summary_writer.add_histogram(f"eigenspectrum", eig, global_step=global_step)
 
 
     if FLAGS.SAVE:

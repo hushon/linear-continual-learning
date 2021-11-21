@@ -240,6 +240,69 @@ class MIT67(datasets.VisionDataset):
         return len(self.labels)
 
 
+class DataIncrementalFourfoldMIT67(datasets.VisionDataset):
+    train_meta_list = [
+        'TrainImages0.csv',
+        'TrainImages1.csv',
+        'TrainImages2.csv',
+        'TrainImages3.csv'
+        ]
+    test_meta = 'TestImages.csv'
+    code_to_class = [
+            'airport_inside', 'artstudio', 'auditorium', 'bakery', 'bar',
+            'bathroom', 'bedroom', 'bookstore', 'bowling', 'buffet', 'casino',
+            'children_room', 'church_inside', 'classroom', 'cloister',
+            'closet', 'clothingstore', 'computerroom', 'concert_hall',
+            'corridor', 'deli', 'dentaloffice', 'dining_room', 'elevator',
+            'fastfood_restaurant', 'florist', 'gameroom', 'garage', 'greenhouse',
+            'grocerystore', 'gym', 'hairsalon', 'hospitalroom', 'inside_bus',
+            'inside_subway', 'jewelleryshop', 'kindergarden', 'kitchen',
+            'laboratorywet', 'laundromat', 'library', 'livingroom', 'lobby',
+            'locker_room', 'mall', 'meeting_room', 'movietheater', 'museum',
+            'nursery', 'office', 'operating_room', 'pantry', 'poolinside',
+            'prisoncell', 'restaurant', 'restaurant_kitchen', 'shoeshop',
+            'stairscase', 'studiomusic', 'subway', 'toystore', 'trainstation',
+            'tv_studio', 'videostore', 'waitingroom', 'warehouse', 'winecellar'
+        ]
+    MEAN = (0.4811, 0.4272, 0.3688)
+    STD = (0.2656, 0.2584, 0.2606)
+
+    def __init__(
+            self,
+            root: str,
+            task_id: int,
+            transform: Optional[Callable] = None,
+            target_transform: Optional[Callable] = None,
+            train: bool = True,
+            loader = pil_loader,
+    ) -> None:
+        super().__init__(root, transform=transform, target_transform=target_transform)
+        assert train == True
+
+        meta_file = os.path.join(self.root, self.train_meta_list[task_id])
+        df = pd.read_csv(meta_file)
+
+        self.images = [os.path.join(self.root, x) for x in df['path']]
+        self.labels = list(df['label'])
+
+        self.loader = loader
+
+    def __getitem__(self, index: int) -> Tuple[Any, Any]:
+        img = self.loader(self.images[index])
+        target = self.labels[index]
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return img, target
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+
 class StanfordDogs120(datasets.VisionDataset):
     train_list = 'train_list.mat'
     test_list = 'test_list.mat'

@@ -21,7 +21,7 @@ import shutil
 from kfac import KFACRegularizer, EWCRegularizer, get_center_dict, EKFACRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
-from utils import get_log_dir, get_timestamp
+from utils import get_log_dir, get_timestamp, SlackWriter
 from regularizer import MASRegularizer
 
 
@@ -53,14 +53,19 @@ class FLAGS(NamedTuple):
     CHECKPOINT_DIR = '/workspace/runs/pretrain_tinyimagenet_resnet18' # TinyImageNet, ResNet18 pretrained
     LOG_DIR = '/workspace/runs'
     BATCH_SIZE = 128
-    INIT_LR = 1e-3
+    INIT_LR = 1e-4
     WEIGHT_DECAY = 1e-5
     # WEIGHT_DECAY = 0
     MAX_STEP = 4000
     N_WORKERS = 4
     BN_UPDATE_STEPS = 1000
     SAVE = True
-    METHOD = 'MAS'
+    METHOD = 'EWC'
+    OPTIM = 'ADAM'
+    LOSS_FN = 'SCE'
+    LINEARIZED = False
+    TRACK_BN = False
+    WEBHOOKS_URL = "https://hooks.slack.com/services/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"
 
 
 def tprint(obj):
@@ -91,7 +96,6 @@ def weight_decay_origin(model: nn.Module, lam: float = 1e-4):
             #     module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
 
 
-# maybe regularize weights only?
 
 
 def make_dataloader(
@@ -119,6 +123,13 @@ def freeze_parameters(model: nn.Module):
         param.requires_grad_(False)
 
 
+def compute_mse_loss(logit, target) -> torch.Tensor:
+    return 0.5*F.mse_loss(logit, 15.*F.one_hot(target, num_classes=100).float(), reduction='none').sum(1)
+
+def compute_sce_loss(logit, target) -> torch.Tensor:
+    return F.cross_entropy(logit, target, reduction='none')
+
+
 class MultiHeadWrapper(nn.Module):
     def __init__(self, module, n_heads, in_features, out_features):
         super().__init__()
@@ -139,18 +150,20 @@ class CustomMSELoss(nn.MSELoss):
 
 
 class LWF:
-    def __init__(self, teacher_model: MultiHeadWrapper, criterion: nn.Module):
+    def __init__(self, teacher_model: MultiHeadWrapper, loss: str):
         self.teacher_model = copy.deepcopy(teacher_model)
-        self.criterion = criterion
+        self.loss = loss
 
     def compute_loss(self, input: list, pred: list, t: int):
         with torch.no_grad():
             target = self.teacher_model(input)
 
-        if type(self.criterion) == nn.KLDivLoss:
-            pred = [x.log_softmax(1) for x in pred]
-            target = [x.softmax(1) for x in target]
-        loss = sum(self.criterion(pred[i], target[i]).sum(-1).mean() for i in range(t))
+        if self.loss == 'kl':
+            loss = sum(F.kl_div(pred[i].log_softmax(1), target[i].softmax(1), reduction='none').sum(1).mean(0) for i in range(t))
+        elif self.loss == 'mse':
+            loss = sum(0.5*F.mse_loss(pred[i], target[i], reduction='none').sum(1).mean(0) for i in range(t))
+        else:
+            raise ValueError
         return loss
 
 def initialize_model(model: MultiHeadWrapper, sample_input: torch.Tensor):
@@ -172,8 +185,8 @@ def main():
     summary_writer = SummaryWriter(log_dir=log_dir, max_queue=1)
     print(f"{log_dir=}")
 
-    if FLAGS.SAVE:
-        shutil.copytree('./', log_dir, dirs_exist_ok=True)
+    # if FLAGS.SAVE:
+    #     shutil.copytree('./', log_dir, dirs_exist_ok=True)
 
 
     transform_train = T.Compose([
@@ -213,10 +226,6 @@ def main():
     # initialize grad attributes to zeros
     initialize_model(model, torch.zeros((1, 3, 32, 32), device='cuda'))
 
-    if FLAGS.METHOD in ('LWF', 'MAS', None):
-        criterion = nn.CrossEntropyLoss(reduction='none')
-    else:
-        criterion = CustomMSELoss(reduction='none')
 
     @torch.no_grad()
     def update_batchnorm():
@@ -228,6 +237,7 @@ def main():
             input = input.cuda()
             model(input)
 
+
     @torch.no_grad()
     def evaluate(data_loader, t):
         losses = []
@@ -237,10 +247,10 @@ def main():
             input = input.cuda()
             target = target.cuda()
             output = model(input)[t]
-            if FLAGS.METHOD in ('LWF', 'MAS', None):
-                loss = criterion(output, target).mean()
-            else:
-                loss = criterion(output, 15.*F.one_hot(target, num_classes=10).float()).sum(-1)
+            if FLAGS.LOSS_FN == 'SCE':
+                loss = F.cross_entropy(output, target, reduction='none')
+            elif FLAGS.LOSS_FN == 'MSE':
+                loss = 0.5*F.mse_loss(output, 15.*F.one_hot(target, num_classes=10).float(), reduction='none').sum(1)
             losses.append(loss.view(-1))
             corrects.append((target == output.max(-1).indices).view(-1))
         avg_loss = torch.cat(losses).mean().item()
@@ -283,31 +293,32 @@ def main():
     for t in trange(len(train_dataset_sequence)):
         train_loader = make_dataloader(train_dataset_sequence[t], True)
         train_loader_cycle = icycle(train_loader)
-        if FLAGS.METHOD in ('LWF', 'MAS'):
+        if FLAGS.OPTIM == 'SGD':
             optimizer = optim.SGD([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR, momentum=0.9)
-        else:
+        elif FLAGS.OPTIM == 'ADAM':
             optimizer = optim.Adam([p for n, p in model.named_parameters() if 'bn' not in n], lr=FLAGS.INIT_LR)
+        else:
+            raise NotImplementedError
         # lr_scheduler = optim.lr_scheduler.LambdaLR(optimizer, linear_schedule(FLAGS.MAX_STEP))
         lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, FLAGS.MAX_STEP)
 
         if FLAGS.METHOD == 'LWF':
-            regularizer = LWF(model, nn.KLDivLoss(reduction='none'))
-        elif FLAGS.METHOD == 'LWF+KFAC':
-            regularizer_lwf = LWF(model, criterion)
-        elif FLAGS.METHOD == 'LWF+EWC':
-            regularizer_lwf = LWF(model, criterion)
+            if FLAGS.LOSS_FN == 'SCE':
+                regularizer = LWF(model, loss='kl')
+            elif FLAGS.LOSS_FN == 'MSE':
+                regularizer = LWF(model, loss='mse')
 
-        model.eval()
+        model.train(FLAGS.TRACK_BN)
         for i in range(max_step := FLAGS.MAX_STEP):
             input, target = next(train_loader_cycle)
             input = input.cuda()
             target = target.cuda()
             optimizer.zero_grad()
             output = model(input)
-            if FLAGS.METHOD in ('LWF', 'MAS', None):
-                mse_loss = criterion(output[t], target).mean()
-            else:
-                mse_loss = criterion(output[t], 15.*F.one_hot(target, num_classes=10).float()).sum(-1).mean()
+            if FLAGS.LOSS_FN == 'SCE':
+                mse_loss = F.cross_entropy(output[t], target, reduction='none').mean(0)
+            elif FLAGS.LOSS_FN == 'MSE':
+                mse_loss = 0.5*F.mse_loss(output[t], 15.*F.one_hot(target, num_classes=10).float(), reduction='none').sum(1).mean(0)
 
             if FLAGS.METHOD == 'LWF':
                 if t > 0:
@@ -316,17 +327,20 @@ def main():
                     reg_loss = 0.
                 loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'EWC':
-                # reg_loss = regularizer.compute_loss()
-                reg_loss = sum(r.compute_loss() for r in regularizer_list) * 1.0
+                if t > 0:
+                    # reg_loss = sum(r.compute_loss() for r in regularizer_list) * 1.0
+                    reg_loss = regularizer.compute_loss(center_dict) * t * 1.0
+                else:
+                    reg_loss = 0.
                 loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'KFAC':
-                if regularizer is not None:
+                if t > 0:
                     reg_loss = regularizer.compute_loss(center_dict) * t
                 else:
                     reg_loss = 0.
                 loss = (mse_loss + reg_loss)/(t+1)
             elif FLAGS.METHOD == 'EKFAC':
-                if regularizer is not None:
+                if t > 0:
                     reg_loss = regularizer.compute_loss(center_dict) * t
                 else:
                     reg_loss = 0.
@@ -358,27 +372,54 @@ def main():
             optimizer.step()
             lr_scheduler.step()
 
-            if global_step%100 == 0:
+            if (global_step+1)%100 == 0:
                 tprint(f'[TRAIN][{i}/{max_step}] LR {lr_scheduler.get_last_lr()[-1]:.2e} | {mse_loss.cpu().item():.3f} | {reg_loss:.3f}')
                 summary_writer.add_scalar('lr', lr_scheduler.get_last_lr()[-1], global_step=global_step)
 
-            if global_step%500 == 0:
+            if (global_step+1)%500 == 0:
                 evaluate_sequence(t)
+                model.train(FLAGS.TRACK_BN)
 
             global_step += 1
 
-        evaluate_sequence(t)
+        # evaluate_sequence(t)
 
 
         if FLAGS.METHOD == 'EWC':
-            # compute ewc state
-            regularizer = EWCRegularizer(model, criterion, [m for m in model.modules() if isinstance(m, (CustomLinear, CustomConv2d, CustomBatchNorm2d))])
-            regularizer.compute_curvature(train_dataset_sequence[t], 1000, t) # TODO: not fair becuase of batch sizes
-            regularizer_list.append(regularizer)
+            if FLAGS.LOSS_FN == 'SCE':
+                criterion = lambda logit, target: F.cross_entropy(logit, target, reduction='none')
+                pseudo_target_fn = lambda logit: torch.distributions.Categorical(logit.softmax(1)).sample()
+            elif FLAGS.LOSS_FN == 'MSE':
+                criterion = lambda logit, target: 0.5*F.mse_loss(logit, target, reduction='none').sum(1)
+                pseudo_target_fn = torch.normal
+            # regularizer = EWCRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+            # # regularizer = EWCRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d))])
+            # regularizer.compute_curvature(train_dataset_sequence[t], 1000, t, pseudo_target_fn=pseudo_target_fn)
+            # center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+            # regularizer_list.append(regularizer)
+            if t == 0:
+                regularizer = EWCRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                # regularizer = EWCRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d))])
+                regularizer.compute_curvature(train_dataset_sequence[t], 1000, t, pseudo_target_fn=pseudo_target_fn)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+            else:
+                new_regularizer = EWCRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                # new_regularizer = EWCRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d))])
+                new_regularizer.compute_curvature(train_dataset_sequence[t], 1000, t, pseudo_target_fn=pseudo_target_fn)
+                center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
+                for old_ewc_state, new_ewc_state in zip(regularizer.ewc_state_dict.values(), new_regularizer.ewc_state_dict.values()):
+                    old_ewc_state.G_weight = (old_ewc_state.G_weight*t + new_ewc_state.G_weight)/(t+1)
+                    if old_ewc_state.G_bias is not None:
+                        old_ewc_state.G_bias = (old_ewc_state.G_bias*t + new_ewc_state.G_bias)/(t+1)
 
         if FLAGS.METHOD == 'KFAC':
-            # compute kfac state
-            if regularizer is None:
+            if FLAGS.LOSS_FN == 'SCE':
+                criterion = lambda logit, target: F.cross_entropy(logit, target, reduction='none')
+                pseudo_target_fn = lambda logit: torch.distributions.Categorical(logit.softmax(1)).sample()
+            elif FLAGS.LOSS_FN == 'MSE':
+                criterion = lambda logit, target: 0.5*F.mse_loss(logit, target, reduction='none').sum(1)
+                pseudo_target_fn = torch.normal
+            if t == 0:
                 regularizer = KFACRegularizer(model, criterion, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
                 regularizer.compute_curvature(train_dataset_sequence[t], 1000, t, batch_size=128)
                 center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
@@ -428,7 +469,7 @@ def main():
             regularizer_list.append(regularizer)
 
         elif FLAGS.METHOD == 'MAS':
-            if regularizer is None:
+            if t == 0:
                 regularizer = MASRegularizer(model, [m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])
                 regularizer.compute_importance(train_dataset_sequence[t], 1000, t)
                 center_dict = get_center_dict([m for m in model.module.modules() if isinstance(m, (nn.Linear, nn.Conv2d))])

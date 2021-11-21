@@ -310,16 +310,26 @@ class KFACRegularizer:
             for p in m.parameters():
                 p.requires_grad_(True)
 
-    def compute_loss(self, center_state_dict: Mapping[nn.Module, CenterState]) -> torch.Tensor:
-        losses = []
+    def compute_loss(self, center_state_dict: Mapping[nn.Module, CenterState], damping: float = None) -> torch.Tensor:
+        loss = 0.
         for module in self.modules:
+            kfac_state = self.kfac_state_dict[module]
+            center_state = center_state_dict[module]
+            if damping is not None:
+                dim_a = kfac_state.A.size(0)
+                dim_g = kfac_state.S.size(0)
+                pi = torch.sqrt((kfac_state.A.trace()*dim_g)/(kfac_state.S.trace()*dim_a))
+                damping = pi.new_tensor(damping)
+                kfac_state = KFACState(
+                    A = kfac_state.A + torch.zeros_like(kfac_state.A).fill_diagonal_(torch.sqrt(damping) * pi),
+                    S = kfac_state.S + torch.zeros_like(kfac_state.S).fill_diagonal_(torch.sqrt(damping) / pi)
+                )
             if type(module) in (nn.Linear, nn.Conv2d, nn.BatchNorm2d):
-                losses.append(KFAC_penalty.apply(self.kfac_state_dict[module], center_state_dict[module], module.weight, module.bias))
+                loss += KFAC_penalty.apply(kfac_state, center_state, module.weight, module.bias)
             elif type(module) in (CustomLinear, CustomConv2d, CustomBatchNorm2d):
-                losses.append(KFAC_penalty.apply(self.kfac_state_dict[module], center_state_dict[module], module.weight_tangent, module.bias_tangent))
+                loss += KFAC_penalty.apply(kfac_state, center_state, module.weight_tangent, module.bias_tangent)
             else:
                 raise NotImplementedError
-        loss = sum(losses)
         return loss
 
 
@@ -647,24 +657,15 @@ class EKFACRegularizer:
                 # g.shape = (B, Nout)
                 if module.bias is not None:
                     a = F.pad(a, (0,1), value=1) # (B, Nin+1)
-                # grad = torch.bmm(g[:, :, None], a[:, None, :]) # (B, Nout, Nin)
                 grad = torch.einsum("bi, bj -> bij", g, a)
             elif type(module) in (nn.Conv2d, CustomConv2d):
                 # a.shape = (B, Cin, h, w)
                 # g.shape = (B, Cout, h, w)
-                b = g.size(0)
-                hw = g.size(2)*g.size(3)
                 a = F.unfold(a, module.kernel_size, module.dilation, module.padding, module.stride) # (B, Cin*k*k, h*w)
                 if module.bias is not None:
                     a = F.pad(a, (0,0,0,1,0,0), value=1) # (B, Cin*k*k+1, h*w)
-                # a = a.transpose(1, 2).reshape(b*hw, -1) # (B*h*w, Cin*k*k)
-                # g = g.permute(0, 2, 3, 1).reshape(b*hw, -1) # (B*h*w, Cout)
-                # grad = torch.bmm(g[:, :, None], a[:, None, :]) # (B*h*w, Cout, Cin*k*k)
-                # grad = grad.reshape(b, hw, grad.size(1), grad.size(2)).sum(1) # (B, Cout, Cin*k*k)
-
                 g = g.reshape(g.size(0), g.size(1), -1) # (B, Cout, h*w)
-                # grad = torch.einsum("bij, bkj -> bik", g, a)
-                grad = oe.contract("bij, bkj -> bik", g, a, backend='torch')
+                grad = torch.einsum("bij, bkj -> bik", g, a)
             elif type(module) in (nn.BatchNorm2d, CustomBatchNorm2d):
                 # a.shape = (B, C, h, w)
                 # g.shape = (B, C, h, w)
@@ -676,8 +677,7 @@ class EKFACRegularizer:
             else:
                 raise NotImplementedError
             # grad = torch.chain_matmul(ekfac_state.Q_S.T, grad, ekfac_state.Q_A)
-            # grad = torch.einsum("ij, bjk, kl -> bil", ekfac_state.Q_S.T, grad, ekfac_state.Q_A) # TODO: not sure about this
-            grad = oe.contract("ij, bjk, kl -> bil", ekfac_state.Q_S.T, grad, ekfac_state.Q_A, backend='torch') # TODO: not sure about this
+            grad = torch.einsum("ij, bjk, kl -> bil", ekfac_state.Q_S.T, grad, ekfac_state.Q_A)
             ekfac_state.scale.add_(grad.pow(2).mean(0)) # (Nout, Nin) or (Cout, Cin*k*k)
         self.n_iter += 1
 

@@ -13,6 +13,60 @@ import torch.nn.functional as F
 import socket
 from datetime import datetime
 import os
+import json
+import sys
+import requests
+
+class SlackWriter:
+    def __init__(self, webhook_url: str) -> None:
+        r"""Send messages to the Slack channnel.
+
+        Configure Incoming Webhooks and pass the URL token.
+
+        Incoming Webhooks: https://slack.com/apps/A0F7XDUAZ
+
+        URL format: `https://hooks.slack.com/services/**/**/**`
+
+        Args:
+            webhook_url (str): a token URL string.
+        """
+        assert isinstance(webhook_url, str)
+        self.webhook_url = webhook_url
+
+    def _send_json_post(self, payload: dict):
+        payload = json.dumps(payload)
+        headers = {
+            'Content-Type': "application/json",
+            'Content-Length': str(sys.getsizeof(payload)),
+            }
+        try:
+            response = requests.post(
+                url=self.webhook_url,
+                data=payload,
+                headers=headers
+                )
+            return response
+        except requests.RequestException as e:
+            print(e)
+
+    def write(self, message: str) -> bool:
+        """Sends a text message to the chat.
+
+        Args:
+            message (str): body message
+
+        Returns:
+            bool: True if successful.
+        """
+        assert isinstance(message, str)
+        data = {
+            "text": message
+        }
+        response = self._send_json_post(data)
+        if response is not None:
+            return response.status_code == 200
+        else:
+            return False
 
 
 def image_loader(path: str) -> Image.Image:
@@ -32,7 +86,7 @@ def get_log_dir(base_path, comment=''):
 
 
 def get_timestamp() -> str:
-    return datetime.now().strftime('%b%d_%H-%M-%S')
+    return datetime.now().strftime('%b%d_%H%M%S')
 
 
 def get_logger(log_path, level=logging.INFO):
