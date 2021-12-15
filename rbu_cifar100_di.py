@@ -21,6 +21,7 @@ from regularizer import MASRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
 from utils import get_timestamp, image_loader, SlackWriter
+from tkfac import TKFACRegularizer
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -54,17 +55,17 @@ class FLAGS(NamedTuple):
     BATCH_SIZE = 128
     # INIT_LR = 1e-4
     INIT_LR = 1e-3
-    # INIT_LR = 1e-2
     WEIGHT_DECAY = 1e-5
     MAX_STEP = 10000
+    # MAX_STEP = 50000
     N_WORKERS = 4
-    BN_UPDATE_STEPS = 1000
+    BN_UPDATE_STEPS = 0
     SAVE = True
-    METHOD = None
+    METHOD = 'KFAC'
     OPTIM = 'SGD'
     LOSS_FN = 'SCE'
     LINEARIZED = False
-    TRACK_BN = True
+    TRACK_BN = False
     LR_SCHEDULE = 'LINEAR'
     DAMPING = 1e-4
     CLIP_GRAD = 1.0
@@ -228,8 +229,8 @@ def main():
         T.ToTensor(),
         T.Normalize(CIFAR100_MEAN, CIFAR100_STD)
         ])
-    train_dataset_sequence = [DataIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(10)]
-    # train_dataset_sequence = [DataIncrementalHundredfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(100)]
+    # train_dataset_sequence = [DataIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(10)]
+    train_dataset_sequence = [DataIncrementalHundredfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(100)]
     test_dataset = datasets.CIFAR100(FLAGS.DATA_ROOT, train=False, transform=transform_test)
     test_loader = make_dataloader(test_dataset, train=False)
     num_classes = 100
@@ -321,7 +322,7 @@ def main():
 
 
     global_step = 0
-    # update_batchnorm()
+    update_batchnorm()
 
     max_steps = [2*FLAGS.MAX_STEP] + [FLAGS.MAX_STEP]*99
     init_lrs = [FLAGS.INIT_LR] + [FLAGS.INIT_LR]*99
@@ -330,8 +331,8 @@ def main():
         train_loader = make_dataloader(train_dataset_sequence[t], True)
         train_loader_cycle = icycle(train_loader)
 
-        # trainable_params = [p for n, p in model.named_parameters() if 'bn' not in n]
-        trainable_params = list(model.parameters())
+        trainable_params = [p for n, p in model.named_parameters() if 'bn' not in n]
+        # trainable_params = list(model.parameters())
 
         params_orig = copy.deepcopy(trainable_params)
 
@@ -363,9 +364,11 @@ def main():
 
         model.train(FLAGS.TRACK_BN)
         for i in (pbar := trange(max_steps[t])):
-            # if t == 0:
-            #     model.load_state_dict(torch.load('./checkpoint/hundredfold-mit67-init/state_dict.pt'), strict=not FLAGS.LINEARIZED)
-            #     break
+            if t == 0:
+                # model.load_state_dict(torch.load('./checkpoint/tenfold_init/state_dict.pt'), strict=not FLAGS.LINEARIZED)
+                model.load_state_dict(torch.load('./checkpoint/hundredfold_init/state_dict.pt'), strict=not FLAGS.LINEARIZED)
+                # model.load_state_dict(torch.load('./checkpoint/hundredfold-mit67-init/state_dict.pt'), strict=not FLAGS.LINEARIZED)
+                break
 
             optimizer.zero_grad()
             input, target = next(train_loader_cycle)
@@ -400,6 +403,13 @@ def main():
                     reg_loss = 0.
                 loss = (data_loss + reg_loss)/(t+1)
 
+            elif FLAGS.METHOD == 'TKFAC':
+                if t > 0:
+                    reg_loss = regularizer.compute_loss(center_dict) * t
+                else:
+                    reg_loss = 0.
+                loss = (data_loss + reg_loss)/(t+1)
+
             elif FLAGS.METHOD == 'MAS':
                 if t>0:
                     reg_loss = regularizer.compute_loss(center_dict) * t
@@ -426,7 +436,7 @@ def main():
             loss.backward()
             # weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
             # weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
-            if FLAGS.METHOD in ('EWC', 'KFAC', 'MAS'):
+            if FLAGS.METHOD in ('EWC', 'KFAC', 'MAS', 'TKFAC'):
                 damping(params_orig, trainable_params, lam=FLAGS.DAMPING)
             if FLAGS.CLIP_GRAD:
                 nn.utils.clip_grad_norm_(trainable_params, FLAGS.CLIP_GRAD)
@@ -446,12 +456,12 @@ def main():
 
             global_step += 1
 
-        ###
-        if t == 0:
-            save_pickle()
-            import sys
-            sys.exit()
-        ###
+        # ###
+        # if t == 0:
+        #     save_pickle()
+        #     import sys
+        #     sys.exit()
+        # ###
 
         if FLAGS.METHOD == 'EWC':
             if FLAGS.LOSS_FN == 'SCE':
@@ -498,6 +508,28 @@ def main():
                 for old_kfac_state, new_kfac_state in zip(regularizer.kfac_state_dict.values(), new_regularizer.kfac_state_dict.values()):
                     old_kfac_state.A = (old_kfac_state.A*t + new_kfac_state.A)/(t+1)
                     old_kfac_state.S = (old_kfac_state.S*t + new_kfac_state.S)/(t+1)
+
+        if FLAGS.METHOD == 'TKFAC':
+            if FLAGS.LOSS_FN == 'SCE':
+                criterion = lambda logit, target: F.cross_entropy(logit, target, reduction='none')
+                pseudo_target_fn = lambda logit: torch.distributions.Categorical(logit.softmax(1)).sample()
+            elif FLAGS.LOSS_FN == 'MSE':
+                criterion = lambda logit, target: 0.5*F.mse_loss(logit, target, reduction='none').sum(1)
+                pseudo_target_fn = torch.normal
+            modules_to_regularize = [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d))]
+            # modules_to_regularize = [m for m in model.modules() if isinstance(m, (nn.Linear, nn.Conv2d, nn.BatchNorm2d))]
+            tprint(modules_to_regularize)
+            if t == 0:
+                regularizer = TKFACRegularizer(model, criterion, modules_to_regularize)
+                regularizer.compute_curvature(train_dataset_sequence[t], 1000, pseudo_target_fn=pseudo_target_fn)
+                center_dict = get_center_dict(modules_to_regularize)
+            else:
+                new_regularizer = TKFACRegularizer(model, criterion, modules_to_regularize)
+                new_regularizer.compute_curvature(train_dataset_sequence[t], 1000, pseudo_target_fn=pseudo_target_fn)
+                center_dict = get_center_dict(modules_to_regularize)
+                for old_tkfac_state, new_tkfac_state in zip(regularizer.tkfac_state_dict.values(), new_regularizer.tkfac_state_dict.values()):
+                    old_tkfac_state.A = (old_tkfac_state.A*t + new_tkfac_state.A)/(t+1)
+                    old_tkfac_state.S = (old_tkfac_state.S*t + new_tkfac_state.S)/(t+1)
 
         elif FLAGS.METHOD == 'MAS':
             if t == 0:

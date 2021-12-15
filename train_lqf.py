@@ -47,22 +47,25 @@ class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
     # CHECKPOINT_PATH = '/workspace/runs/temp111/state_dict.pt' # CIFAR ResNet18, ImageNet32 pretrained
     # CHECKPOINT_PATH = '/workspace/runs/torch_imagenet32_resnet50_new/state_dict.pt' # CIFAR ResNet50, ImageNet32 pretrained
-    CHECKPOINT_PATH = '/workspace/runs/pretrain_tinyimagenet_resnet18/state_dict.pt' # CIFAR ResNet18, TinyImageNet pretrained
+    # CHECKPOINT_PATH = '/workspace/runs/pretrain_tinyimagenet_resnet18/state_dict.pt' # CIFAR ResNet18, TinyImageNet pretrained
     # CHECKPOINT_PATH = '/workspace/runs/imagenet_resnet18_lrelu/model_best.pt' # ImageNet ResNet18, ImageNet pretrained
     # CHECKPOINT_PATH = './checkpoint/imagenet_resnet18_lrelu_lr0.001/model_best.pt' # ImageNet ResNet18, ImageNet pretrained
+    CHECKPOINT_PATH = "./checkpoint/mocov2_resnet50/moco_v2_800ep_pretrain.pth.tar" # ResNet50 MoCo v2 pretrained
     LOG_DIR = '/workspace/runs/'
     BATCH_SIZE = 128
-    # INIT_LR = 1E-4
-    INIT_LR = 1E-2
+    INIT_LR = 1E-4
+    # INIT_LR = 1E-2
     WEIGHT_DECAY = 1E-5
-    MAX_STEP = 8000
-    N_WORKERS = 4
-    BN_UPDATE_STEPS = 1000
+    MAX_STEP = 20000
+    N_WORKERS = 8
+    # BN_UPDATE_STEPS = 1000
+    BN_UPDATE_STEPS = 0
     SAVE = True
-    LOSS_FN = 'SCE'
-    OPTIM = 'SGD'
-    GAF = False
-    TRACK_BN = True
+    LOSS_FN = 'MSE'
+    OPTIM = 'ADAM'
+    GAF = True
+    TRACK_BN = False
+    AMP = True
 
 
 
@@ -253,8 +256,8 @@ def main():
     summary_writer = SummaryWriter(log_dir=log_dir, max_queue=1)
     print(f"{log_dir=}")
 
-    train_dataset, test_dataset, n_classes = get_cifar100()
-    # train_dataset, test_dataset, n_classes = get_caltech256()
+    # train_dataset, test_dataset, n_classes = get_cifar100()
+    train_dataset, test_dataset, n_classes = get_caltech256()
     # train_dataset, test_dataset, n_classes = get_mit67()
 
     transform_target = get_target_transform_fn(n_classes, 15.)
@@ -272,20 +275,33 @@ def main():
 
 
     if FLAGS.GAF:
-        from models.resnet_cifar100_jvplrelu import resnet18, resnet50
-        # from models.resnet_imagenet_jvplrelu import resnet18
+        # from models.resnet_cifar100_jvplrelu import resnet18, resnet50
+        from models.resnet_imagenet_jvplrelu import resnet18, resnet50
     else:
-        from models.resnet_cifar100_lrelu import resnet18, resnet50
-        # from models.resnet_imagenet_lrelu import resnet18
+        # from models.resnet_cifar100_lrelu import resnet18, resnet50
+        from models.resnet_imagenet_lrelu import resnet18, resnet50
 
-    model = resnet18(num_classes=n_classes).cuda()
-    # model = resnet50(num_classes=n_classes).cuda()
+    # from torchvision.models import resnet18, resnet50
+
+    # model = resnet18(num_classes=n_classes).cuda()
+    model = resnet50(num_classes=n_classes).cuda()
     state_dict = torch.load(FLAGS.CHECKPOINT_PATH)
     # state_dict.pop('fc.weight')
     # state_dict.pop('fc.bias')
-    model.load_state_dict(state_dict, strict=False)
 
-    import torchvision
+    if "moco" in FLAGS.CHECKPOINT_PATH:
+        state_dict = state_dict["state_dict"]
+        for k in list(state_dict.keys()):
+            # retain only encoder_q up to before the embedding layer
+            if k.startswith('module.encoder_q') and not k.startswith('module.encoder_q.fc'):
+                # remove prefix
+                state_dict[k[len("module.encoder_q."):]] = state_dict[k]
+            # delete renamed or unused k
+            del state_dict[k]
+
+    response = model.load_state_dict(state_dict, strict=False)
+    print(response)
+
     # model = torchvision.models.resnet18(pretrained=True)
     # model.fc = nn.Linear(512, n_classes)
     # model = torchvision.models.resnet50(pretrained=True)
@@ -382,6 +398,8 @@ def main():
     train_loader = icycle(train_loader)
     global_step = 0
 
+    grad_scaler = amp.GradScaler(enabled=FLAGS.AMP)
+
     model.train(FLAGS.TRACK_BN)
 
     for i in (pbar := trange(FLAGS.MAX_STEP, desc=f'{timestamp}')):
@@ -389,15 +407,20 @@ def main():
         input, target = next(train_loader)
         input = input.cuda()
         target = target.cuda()
-        output = model(input)
-        if FLAGS.LOSS_FN == 'MSE':
-            loss = criterion(output, transform_target(target)).sum(1).mean()
-        elif FLAGS.LOSS_FN == 'SCE':
-            loss = criterion(output, target).mean()
-        loss.backward(create_graph=isinstance(optimizer, torch_optimizer.Adahessian))
+        with amp.autocast(enabled=FLAGS.AMP):
+            output = model(input)
+            if FLAGS.LOSS_FN == 'MSE':
+                loss = criterion(output, transform_target(target)).sum(1).mean()
+            elif FLAGS.LOSS_FN == 'SCE':
+                loss = criterion(output, target).mean()
+        # loss.backward(create_graph=isinstance(optimizer, torch_optimizer.Adahessian))
+        grad_scaler.scale(loss).backward()
+        grad_scaler.unscale_(optimizer)
+
         weight_decay(model.named_parameters(), FLAGS.WEIGHT_DECAY)
         # weight_decay_origin(model, FLAGS.WEIGHT_DECAY)
-        optimizer.step()
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
         lr_scheduler.step()
         global_step += 1
 

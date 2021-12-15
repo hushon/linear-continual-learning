@@ -27,6 +27,13 @@ class EKFACState:
 
 
 @dataclass
+class TKFACState:
+    A: torch.Tensor = None
+    S: torch.Tensor = None
+    trace: torch.Tensor = None
+
+
+@dataclass
 class EWCState:
     G_weight: torch.Tensor = None
     G_bias: Optional[torch.Tensor] = None
@@ -81,8 +88,8 @@ def compute_A(module: nn.Module, a: torch.Tensor) -> torch.Tensor:
         # a = a.reshape(a.size(0), -1)
         # A = torch.mm(a, a.T)
         A = torch.einsum("bij, bkj -> ik", a, a) # (Cin*k*k, Cin*k*k)
-        # A /= bhw
-        A /= a.size(0)
+        A /= bhw
+        # A /= a.size(0)
     elif isinstance(module, nn.BatchNorm2d):
         # a.shape == (B, C, h, w)
         b = a.size(0)
@@ -415,6 +422,16 @@ class KFAC_penalty(torch.autograd.Function):
         else:
             grad_bias = None
         return None, None, grad_weight, grad_bias
+
+
+class KroneckerBiliearProduct(torch.autograd.Function):
+    """Computes the product v.T @ (A⊗B) @ v
+
+    Returns:
+        torch.Tensor: bilinear product (A⊗B)v
+    """
+    # (A⊗B)v = vec(BVA')
+    pass
 
 
 class EWCRegularizer:
@@ -818,4 +835,178 @@ class EKFAC_penalty(torch.autograd.Function):
         else:
             grad_bias = None
         return None, None, grad_weight, grad_bias
+
+
+@torch.no_grad()
+def compute_trace(module: nn.Module, a: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    b = a.size(0)
+    if isinstance(module, nn.Linear):
+        # a.shape == (B, Nin)
+        # g.shape == (B, Nout)
+        if module.bias is not None: #TODO
+            a = F.pad(a, (0,1), value=1) # (B, Nin+1)
+        trace = a.square().sum(1) * g.square().sum(1)
+        trace = trace.mean()
+    elif isinstance(module, nn.Conv2d):
+        # a.shape == (B, Cin, h, w)
+        # g.shape == (B, Cout, h, w)
+        hw = a.size(2) * a.size(3)
+        a = F.unfold(a, module.kernel_size, module.dilation, module.padding, module.stride) # (B, Cin*k*k, h*w)
+        if module.bias is not None:
+            a = F.pad(a, (0,0,0,1,0,0), value=1) # (B, Cin*k*k+1, h*w)
+        trace = a.view(b, -1).square().sum(1) * g.view(b, -1).square().sum(1)
+        trace = trace.mean().div_(hw)
+    else:
+        raise NotImplementedError(f'{type(module)}')
+    return trace
+
+
+class TKFACRegularizer:
+
+    def __init__(self, model: nn.Module, criterion: nn.Module, modules: List[nn.Module]) -> None:
+        self.model = model
+        self.criterion = criterion
+        self.modules : List[nn.Module] = modules
+        self.a_dict : Mapping[nn.Module, torch.Tensor] = OrderedDict()
+        self.g_dict : Mapping[nn.Module, torch.Tensor] = OrderedDict()
+        self.tkfac_state_dict : Mapping[nn.Module, TKFACState] = OrderedDict()
+        self.n_iter = 0
+        self._init_tkfac_states()
+
+    def _init_tkfac_states(self) -> None:
+        for module in self.modules:
+            if isinstance(module, nn.Linear):
+                a_size = module.in_features
+                g_size = module.out_features
+            elif isinstance(module, nn.Conv2d):
+                a_size = module.in_channels * module.kernel_size[0] * module.kernel_size[1]
+                g_size = module.out_channels
+            elif isinstance(module, nn.BatchNorm2d):
+                a_size = g_size = module.num_features
+            else:
+                raise NotImplementedError()
+
+            if module.bias is not None:
+                a_size += 1
+
+            self.tkfac_state_dict[module] = KFACState(
+                A=module.weight.new_zeros((a_size, a_size)),
+                S=module.weight.new_zeros((g_size, g_size)),
+                trace=module.weight.new_tensor(0.)
+            )
+
+    def _del_temp_states(self) -> None:
+        del self.a_dict
+        del self.g_dict
+
+    def _register_hooks(self) -> List[RemovableHandle]:
+        hook_handles = []
+        for module in self.modules:
+            handle = module.register_forward_hook(self._forward_hook)
+            hook_handles.append(handle)
+        return hook_handles
+
+    def _remove_hooks(self, hook_handles: List[RemovableHandle]) -> None:
+        for handle in hook_handles:
+            handle.remove()
+        hook_handles.clear()
+
+    def _forward_hook(self, module: nn.Module, input: Tuple[torch.Tensor, ...], output: Tuple[torch.Tensor, ...]) -> None:
+        if type(module) in (nn.Linear, nn.Conv2d, nn.BatchNorm2d):
+            input, = input
+            output = output
+        elif type(module) in (CustomLinear, CustomConv2d, CustomBatchNorm2d):
+            input, _ = input # primal input
+            _, output = output # tangent output (=jvp)
+        else:
+            raise NotImplementedError
+        self.a_dict[module] = input.detach().clone()
+        def _tensor_backward_hook(grad: torch.Tensor) -> None:
+            self.g_dict[module] = grad.detach().clone()
+        output.requires_grad_(True).register_hook(_tensor_backward_hook)
+
+    @torch.no_grad()
+    def _accumulate_curvature_step(self) -> None:
+        for module in self.modules:
+            a = self.a_dict[module]
+            g = self.g_dict[module]
+            tkfac_state = self.tkfac_state_dict[module]
+            A = compute_A(module, a)
+            S = compute_S(module, g)
+            trace = compute_trace(module, a, g)
+            tkfac_state.A.add_(A)
+            tkfac_state.S.add_(S)
+            tkfac_state.trace.add_(trace)
+        self.n_iter += 1
+
+    def _divide_curvature(self) -> None:
+        for module in self.modules:
+            tkfac_state = self.tkfac_state_dict[module]
+            tkfac_state.A.div_(self.n_iter)
+            tkfac_state.S.div_(self.n_iter)
+            tkfac_state.trace.div_(self.n_iter)
+
+    def compute_curvature(self, dataset: Dataset, n_steps: int, t: int = None, pseudo_target_fn = torch.normal, batch_size=64) -> None:
+        data_loader = MultiEpochsDataLoader(
+                            dataset,
+                            batch_size=batch_size,
+                            shuffle=True,
+                            drop_last=True,
+                            num_workers=4,
+                        )
+        data_loader_cycle = icycle(data_loader)
+
+        for m in self.modules:
+            for p in m.parameters():
+                p.requires_grad_(False)
+
+        hook_handles = self._register_hooks()
+        self.model.eval()
+        for _ in trange(n_steps, desc="compute curvature"):
+            input, _ = next(data_loader_cycle)
+            input = input.cuda()
+            self.model.zero_grad()
+            if t is not None:
+                output = self.model(input)[t]
+            else:
+                output = self.model(input)
+            pseudo_target = pseudo_target_fn(output.detach())
+            loss = self.criterion(output, pseudo_target).sum(-1).sum()
+            loss.backward()
+            self._accumulate_curvature_step()
+
+        self._divide_curvature()
+        self._remove_hooks(hook_handles)
+        self._del_temp_states()
+
+        for m in self.modules:
+            for p in m.parameters():
+                p.requires_grad_(True)
+
+    def add_damping(self, damping: float = None):
+        dim_a = tkfac_state.A.size(0)
+        dim_g = tkfac_state.S.size(0)
+        pi = torch.sqrt((tkfac_state.A.trace()*dim_g)/(tkfac_state.S.trace()*dim_a))
+        damping = pi.new_tensor(damping)
+        tkfac_state = KFACState(
+            A = tkfac_state.A + torch.zeros_like(tkfac_state.A).fill_diagonal_(torch.sqrt(damping) * pi),
+            S = tkfac_state.S + torch.zeros_like(tkfac_state.S).fill_diagonal_(torch.sqrt(damping) / pi)
+        )
+
+    def compute_loss(self, center_state_dict: Mapping[nn.Module, CenterState]) -> torch.Tensor:
+        loss = 0.
+        for module in self.modules:
+            tkfac_state = self.tkfac_state_dict[module]
+            center_state = center_state_dict[module]
+            kfac_state = KFACState(
+                A=tkfac_state.A*tkfac_state.trace / tkfac_state.A.trace(),
+                S=tkfac_state.S / tkfac_state.S.trace(),
+            )
+            if type(module) in (nn.Linear, nn.Conv2d, nn.BatchNorm2d):
+                loss += KFAC_penalty.apply(kfac_state, center_state, module.weight, module.bias)
+            elif type(module) in (CustomLinear, CustomConv2d, CustomBatchNorm2d):
+                loss += KFAC_penalty.apply(kfac_state, center_state, module.weight_tangent, module.bias_tangent)
+            else:
+                raise NotImplementedError
+        return loss
 
