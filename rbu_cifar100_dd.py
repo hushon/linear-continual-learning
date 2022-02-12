@@ -22,7 +22,8 @@ from kfac import KFACRegularizer, EWCRegularizer, EKFACRegularizer, get_center_d
 from regularizer import MASRegularizer
 from models.modules import CustomConv2d, CustomLinear, CustomBatchNorm2d
 import torchvision.transforms.functional as VF
-from utils import get_timestamp
+from utils import get_timestamp, image_loader, SlackWriter
+from tkfac import TKFACRegularizer
 
 
 torch.backends.cuda.matmul.allow_tf32 = False
@@ -49,17 +50,29 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
-    CHECKPOINT_DIR = '/workspace/runs/temp111'
+    CHECKPOINT_PATH = '/workspace/runs/temp111/state_dict.pt' # resnet18 trained on ImageNet32
+    # CHECKPOINT_PATH = '/workspace/runs/pretrain_tinyimagenet_resnet18/state_dict.pt' # TinyImageNet, ResNet18 pretrained
+    # CHECKPOINT_PATH = './checkpoint/imagenet_resnet18_lrelu_lr0.001/model_best.pt' # resnet18 lrelu trained on ImageNet
     LOG_DIR = '/workspace/runs/'
     BATCH_SIZE = 128
     INIT_LR = 1e-4
+    # INIT_LR = 1e-3
     WEIGHT_DECAY = 1e-5
-    # WEIGHT_DECAY = 0
-    MAX_STEP = 4000
+    # MAX_STEP = 10000
+    MAX_STEP = 50000
     N_WORKERS = 4
-    BN_UPDATE_STEPS = 1000
+    BN_UPDATE_STEPS = 0
     SAVE = True
     METHOD = 'KFAC'
+    OPTIM = 'ADAM'
+    LOSS_FN = 'MSE'
+    LINEARIZED = True
+    TRACK_BN = False
+    LR_SCHEDULE = 'LINEAR'
+    DAMPING = 1e-4
+    CLIP_GRAD = 1.0
+    LOG_HISTOGRAM = False
+    WEBHOOKS_URL = "https://hooks.slack.com/services/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"
 
 
 def tprint(obj):
@@ -90,8 +103,6 @@ def weight_decay_origin(model: nn.Module, lam: float = 1e-4):
             #     module.bias_tangent.grad.data.add_(module.bias.data + module.bias_tangent.data, alpha=lam)
 
 
-# maybe regularize weights only?
-
 
 def make_dataloader(
         dataset: torch.utils.data.Dataset,
@@ -118,23 +129,6 @@ def freeze_parameters(model: nn.Module):
         param.requires_grad_(False)
 
 
-class MultiHeadWrapper(nn.Module):
-    def __init__(self, module, n_heads, in_features, out_features):
-        super().__init__()
-        self.module = module
-        self.heads = nn.ModuleList([nn.Linear(in_features, out_features) for _ in range(n_heads)])
-        self.t = None
-
-    def set_head(self, t: int):
-        self.t = t
-
-    def forward(self, x):
-        x = self.module(x)
-        if self.t is None:
-            return [head(x) for head in self.heads]
-        else:
-            return self.heads[self.t](x)
-
 
 class CustomMSELoss(nn.MSELoss):
     def __init__(self, size_average=None, reduce=None, reduction: str = 'mean') -> None:
@@ -143,24 +137,6 @@ class CustomMSELoss(nn.MSELoss):
     def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return 0.5*F.mse_loss(input, target, reduction=self.reduction)
 
-
-class LWF:
-    def __init__(self, teacher_model: MultiHeadWrapper, criterion: nn.Module):
-        self.teacher_model = copy.deepcopy(teacher_model)
-        self.criterion = criterion
-
-    def compute_loss(self, input: torch.Tensor, pred: torch.Tensor):
-        with torch.no_grad():
-            target = self.teacher_model(input)
-        loss = self.criterion(pred, target).sum(-1).mean()
-        return loss
-
-
-def initialize_model(model: MultiHeadWrapper, sample_input: torch.Tensor):
-    output = model(sample_input)
-    loss = sum(o.sum() for o in output)
-    loss.backward()
-    model.zero_grad()
 
 
 def get_target_transform_fn(num_classes: int = 10, alpha: float = 15.0):
@@ -171,11 +147,17 @@ def get_target_transform_fn(num_classes: int = 10, alpha: float = 15.0):
 
 
 def main():
-    log_dir = os.path.join(FLAGS.LOG_DIR, get_timestamp())
-    if FLAGS.SAVE:
-        shutil.copytree('./', log_dir, dirs_exist_ok=True)
+    timestamp = get_timestamp()
+    log_dir = os.path.join(FLAGS.LOG_DIR, timestamp)
+    # if FLAGS.SAVE:
+    #     shutil.copytree('./', log_dir, dirs_exist_ok=True)
     summary_writer = SummaryWriter(log_dir=log_dir, max_queue=1)
     print(f"{log_dir=}")
+
+    slack_writer = SlackWriter(FLAGS.WEBHOOKS_URL)
+    slack_writer.write(f"started {timestamp}")
+    atexit.register(slack_writer.write, f"exited {timestamp}")
+
 
     transform_train = T.Compose([
         T.RandomCrop(32, padding=4),
@@ -183,40 +165,36 @@ def main():
         T.ToTensor(),
         T.Normalize(CIFAR100_MEAN, CIFAR100_STD)
         ])
-    transform_train_jittered = T.Compose([
-        T.RandomCrop(32, padding=4),
-        T.RandomHorizontalFlip(),
-        T.Grayscale(num_output_channels=3),
-        T.Lambda(lambda x: VF.rotate(x, 90)),
-        T.ToTensor(),
-        T.Normalize(CIFAR100_MEAN, CIFAR100_STD)
-        ])
     transform_test = T.Compose([
         T.ToTensor(),
         T.Normalize(CIFAR100_MEAN, CIFAR100_STD)
         ])
-    # num_classes = 10
-    # target_transform = get_target_transform_fn(num_classes=num_classes, alpha=15.0)
-
-    train_dataset_sequence = [DataIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(10)]
-    # train_dataset_sequence = [DataIncrementalHundredfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(100)]
+    # train_dataset_sequence = [DataIncrementalTenfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(10)]
+    train_dataset_sequence = [DataIncrementalHundredfoldCIFAR100(FLAGS.DATA_ROOT, task_id=i, train=True, transform=transform_train) for i in range(100)]
     test_dataset = datasets.CIFAR100(FLAGS.DATA_ROOT, train=False, transform=transform_test)
     test_loader = make_dataloader(test_dataset, train=False)
+    num_classes = 100
 
-    model = resnet18(num_classes=100)
+
+    target_transform = get_target_transform_fn(num_classes=num_classes, alpha=15.0)
+
+
+    if FLAGS.LINEARIZED:
+        from models.resnet_cifar100_jvplrelu import resnet18, resnet50
+        # from models.resnet_imagenet_jvplrelu import resnet18, resnet50
+    else:
+        from models.resnet_cifar100_lrelu import resnet18, resnet50
+        # from models.resnet_imagenet_lrelu import resnet18, resnet50
+    model = resnet18(num_classes=num_classes)
     state_dict = torch.load(os.path.join(FLAGS.CHECKPOINT_DIR, 'state_dict.pt'))
-    model.load_state_dict(state_dict, strict=False)
+    missing_keys, unexpected_keys = model.load_state_dict(torch.load(FLAGS.CHECKPOINT_PATH), strict=False)
     model.cuda()
+
+    tprint(f'{missing_keys=}')
+    tprint(f'{unexpected_keys=}')
 
     # freeze_parameters(model.module)
 
-    # initialize grad attributes to zeros
-    initialize_model(model, torch.zeros((1, 3, 32, 32), device='cuda'))
-
-    if FLAGS.METHOD in ('LWF', 'MAS'):
-        criterion = nn.CrossEntropyLoss(reduction='none')
-    else:
-        criterion = CustomMSELoss(reduction='none')
 
     @torch.no_grad()
     def update_batchnorm():
@@ -237,10 +215,7 @@ def main():
             input = input.cuda()
             target = target.cuda()
             output = model(input)
-            if FLAGS.METHOD in ('LWF', 'MAS'):
-                loss = criterion(output, target).mean()
-            else:
-                loss = criterion(output, 15.*F.one_hot(target, num_classes=100).float()).sum(-1)
+            loss = 0.5*F.mse_loss(output, target_transform(target), reduction='none').sum(1)
             losses.append(loss.view(-1))
             corrects.append((target == output.max(-1).indices).view(-1))
         avg_loss = torch.cat(losses).mean().item()
@@ -257,7 +232,6 @@ def main():
 
 
     global_step = 0
-
     update_batchnorm()
 
     # regularizer = EWCRegularizer(model.module, criterion)

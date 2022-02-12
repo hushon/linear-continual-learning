@@ -13,6 +13,7 @@ from torch.nn.parallel import DataParallel
 from torchvision import datasets
 import atexit
 from PIL import Image
+from models.vgg_cifar100 import vgg16_bn
 
 
 torch.backends.cudnn.benchmark = True
@@ -36,7 +37,7 @@ IMAGENET_STD = (0.229, 0.224, 0.225)
 
 class FLAGS(NamedTuple):
     DATA_ROOT = '/ramdisk/'
-    LOG_DIR = '/workspace/runs/torch_imagenet32_resnet50'
+    LOG_DIR = '/workspace/runs/torch_imagenet32_vgg16'
     BATCH_SIZE = 256*2
     INIT_LR = 2E-1
     WEIGHT_DECAY = 1E-4
@@ -178,7 +179,8 @@ def train():
             )
 
     # model = resnet18(num_classes=1000)
-    model = resnet50(num_classes=1000)
+    # model = resnet50(num_classes=1000)
+    model = vgg16_bn(num_classes=1000)
     model = DataParallel(model).cuda()
 
 
@@ -216,15 +218,15 @@ def train():
 
     def save_pickle():
         pickle = model.module.state_dict()
-        pickle.pop('fc.weight')
-        pickle.pop('fc.bias')
+        # pickle.pop('fc.weight')
+        # pickle.pop('fc.bias')
         pickle_path = os.path.join(FLAGS.LOG_DIR, f'state_dict.pt')
         torch.save(pickle, pickle_path)
         tprint(f'[SAVE] Saved to {pickle_path}')
 
     if FLAGS.SAVE: atexit.register(save_pickle)
 
-    pbar = trange(FLAGS.MAX_EPOCH, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}', smoothing=1.)
+    pbar = trange(FLAGS.MAX_EPOCH, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}', smoothing=1., dynamic_ncols=True)
 
     for epoch in pbar:
         train_epoch()

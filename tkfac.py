@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader, Dataset
 from torch.utils.hooks import RemovableHandle
 from models.modules import CustomLinear, CustomConv2d, CustomBatchNorm2d
 from typing import Tuple, List, NamedTuple, Mapping, Optional, Callable
-from tqdm import tqdm, trange
+from tqdm.auto import tqdm, trange
 from utils import icycle, MultiEpochsDataLoader
 from dataclasses import dataclass
 from collections import OrderedDict
@@ -118,6 +118,7 @@ def compute_trace(module: nn.Module, a: torch.Tensor, g: torch.Tensor) -> torch.
         trace = torch.einsum("bij, bkj -> bik", g, a).square().view(b, -1).sum(1)
         if module.bias is not None:
             trace.add_(g.sum(2).square().sum(1))
+        # trace.shape = (B, )
         trace = trace.sum(0).div_(b)
     elif isinstance(module, nn.BatchNorm2d):
         # a.shape = (B, C, h, w)
@@ -262,16 +263,6 @@ class KFAC_penalty(torch.autograd.Function):
         return None, None, grad_weight, grad_bias
 
 
-class KroneckerBiliearProduct(torch.autograd.Function):
-    """Computes the product v.T @ (A⊗B) @ v
-
-    Returns:
-        torch.Tensor: bilinear product (A⊗B)v
-    """
-    # (A⊗B)v = vec(BVA')
-    pass
-
-
 class TKFACRegularizer:
 
     def __init__(self, model: nn.Module, criterion: nn.Module, modules: List[nn.Module]) -> None:
@@ -331,6 +322,8 @@ class TKFACRegularizer:
             _, output = output # tangent output (=jvp)
         else:
             raise NotImplementedError
+        input: torch.Tensor
+        output: torch.Tensor
         self.a_dict[module] = input.detach().clone()
         def _tensor_backward_hook(grad: torch.Tensor) -> None:
             self.g_dict[module] = grad.detach().clone()
@@ -373,7 +366,7 @@ class TKFACRegularizer:
 
         hook_handles = self._register_hooks()
         self.model.eval()
-        for _ in trange(n_steps, desc="compute curvature"):
+        for _ in trange(n_steps, desc="compute curvature", dynamic_ncols=True):
             input, _ = next(data_loader_cycle)
             input = input.cuda()
             self.model.zero_grad()

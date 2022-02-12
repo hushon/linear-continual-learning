@@ -476,6 +476,61 @@ class TaskIncrementalTenfoldCIFAR100(datasets.VisionDataset):
         return len(self.targets)
 
 
+class ClassIncrementalTenfoldCIFAR100(datasets.CIFAR100):
+    # task_labels = [list(range(i, i+10)) for i in range(0, 100, 10)]
+
+    def __init__(
+            self,
+            root: str,
+            # task_id: int,
+            task_classes: List[int],
+            train: bool = True,
+            transform = None,
+            target_transform = None,
+            download: bool = False,
+    ) -> None:
+        super().__init__(root, train=train, transform=transform,
+                        target_transform=target_transform, download=download)
+        # label_set = self.task_labels[task_id]
+        label_set = task_classes
+        mask = np.isin(self.targets, label_set)
+
+        self.data = np.array(self.data)[mask]
+        self.targets = np.array(self.targets)[mask]
+
+
+class ClassIncrementalFivefoldCIFAR10(datasets.CIFAR10):
+    # task_labels = [list(range(i, i+10)) for i in range(0, 100, 10)]
+
+    def __init__(
+            self,
+            root: str,
+            # task_id: int,
+            task_classes: List[int],
+            train: bool = True,
+            transform = None,
+            target_transform = None,
+            download: bool = False,
+    ) -> None:
+        super().__init__(root, train=train, transform=transform,
+                        target_transform=target_transform, download=download)
+        # label_set = self.task_labels[task_id]
+
+        # self.targets = np.array(self.targets)
+        # m1 = self.targets == 0
+        # m2 = self.targets == 1
+        # self.targets[m1] = 1
+        # self.targets[m2] = 0
+
+        label_set = task_classes
+        mask = np.isin(self.targets, label_set)
+
+        self.data = np.array(self.data)[mask]
+        self.targets = np.array(self.targets)[mask]
+
+
+
+
 # class DataIncrementalTenfoldCIFAR100(datasets.CIFAR100):
 #     def __init__(
 #             self,
